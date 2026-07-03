@@ -6,7 +6,7 @@ import (
 	"io/ioutil"
 	"net/url"
 
-	"github.com/oopsguy/m3u8/tool"
+	"github.com/cnin0770/m3u8_ui/tool"
 )
 
 type Result struct {

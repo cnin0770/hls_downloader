@@ -7,19 +7,20 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
-	"github.com/oopsguy/m3u8/parse"
-	"github.com/oopsguy/m3u8/tool"
+	"github.com/cnin0770/m3u8_ui/parse"
+	"github.com/cnin0770/m3u8_ui/tool"
 )
 
 const (
-	tsExt            = ".ts"
-	tsFolderName     = "ts"
-	mergeTSFilename  = "main.ts"
-	tsTempFileSuffix = "_tmp"
-	progressWidth    = 40
+	tsExt             = ".ts"
+	defaultTimeLayout = "20060102150405"
+	tsTempFileSuffix  = "_tmp"
+	progressWidth     = 40
 )
 
 type Downloader struct {
@@ -27,20 +28,27 @@ type Downloader struct {
 	queue    []int
 	folder   string
 	tsFolder string
+	filename string
 	finish   int32
 	segLen   int
 
-	result *parse.Result
+	result   *parse.Result
+	progress chan Event // all goroutines send here; reporter owns stdout
+	reporter Reporter
+	remuxer  Remuxer
+	prober   DurationProber
+
+	convertToMP4 bool
+	keepTS       bool
 }
 
 // NewTask returns a Task instance
-func NewTask(output string, url string) (*Downloader, error) {
+func NewTask(output string, url string, name string) (*Downloader, error) {
 	result, err := parse.FromURL(url)
 	if err != nil {
 		return nil, err
 	}
 	var folder string
-	// If no output folder specified, use current directory
 	if output == "" {
 		current, err := tool.CurrentDir()
 		if err != nil {
@@ -53,24 +61,76 @@ func NewTask(output string, url string) (*Downloader, error) {
 	if err := os.MkdirAll(folder, os.ModePerm); err != nil {
 		return nil, fmt.Errorf("create storage folder failed: %s", err.Error())
 	}
-	tsFolder := filepath.Join(folder, tsFolderName)
+	taskName := taskTimestamp()
+	tsFolder := filepath.Join(folder, taskName)
 	if err := os.MkdirAll(tsFolder, os.ModePerm); err != nil {
 		return nil, fmt.Errorf("create ts folder '[%s]' failed: %s", tsFolder, err.Error())
 	}
 	d := &Downloader{
 		folder:   folder,
 		tsFolder: tsFolder,
+		filename: outputFilename(name, taskName),
 		result:   result,
+		// buffer generously so download goroutines never block on reporting
+		progress: make(chan Event, 128),
+		reporter: NewHumanReporter(os.Stdout),
+		remuxer:  FFmpegRemuxer{},
+		prober:   FFprobeDurationProber{},
+		keepTS:   true,
 	}
 	d.segLen = len(result.M3u8.Segments)
 	d.queue = genSlice(d.segLen)
 	return d, nil
 }
 
-// Start runs downloader
+func (d *Downloader) SetReporter(reporter Reporter) {
+	if reporter == nil {
+		reporter = NewHumanReporter(os.Stdout)
+	}
+	d.reporter = reporter
+}
+
+func (d *Downloader) SetConversion(convertToMP4 bool, keepTS bool) {
+	d.convertToMP4 = convertToMP4
+	d.keepTS = keepTS
+}
+
+func (d *Downloader) SetRemuxer(remuxer Remuxer) {
+	if remuxer == nil {
+		remuxer = FFmpegRemuxer{}
+	}
+	d.remuxer = remuxer
+}
+
+func (d *Downloader) SetDurationProber(prober DurationProber) {
+	if prober == nil {
+		prober = FFprobeDurationProber{}
+	}
+	d.prober = prober
+}
+
+// Start runs the downloader with a concurrent progress bar.
 func (d *Downloader) Start(concurrency int) error {
 	var wg sync.WaitGroup
-	// struct{} zero size
+
+	// --- reporter goroutine: sole owner of stdout during download ---
+	reporterDone := make(chan struct{})
+	go func() {
+		defer close(reporterDone)
+		for ev := range d.progress {
+			d.reporter.Event(ev)
+		}
+	}()
+	d.reporter.Event(Event{
+		Type:             EventTaskStarted,
+		OutputDir:        d.folder,
+		TSDir:            d.tsFolder,
+		BaseName:         strings.TrimSuffix(d.filename, tsExt),
+		Total:            d.segLen,
+		ExpectedDuration: d.expectedDuration(),
+	})
+
+	// --- download workers ---
 	limitChan := make(chan struct{}, concurrency)
 	for {
 		tsIdx, end, err := d.next()
@@ -84,10 +144,9 @@ func (d *Downloader) Start(concurrency int) error {
 		go func(idx int) {
 			defer wg.Done()
 			if err := d.download(idx); err != nil {
-				// Back into the queue, retry request
-				fmt.Printf("[failed] %s\n", err.Error())
+				d.progress <- segmentFailedEvent(idx, fmt.Sprintf("[failed] seg %d: %s", idx, err.Error()))
 				if err := d.back(idx); err != nil {
-					fmt.Printf(err.Error())
+					d.progress <- Event{Type: EventWarning, Message: err.Error()}
 				}
 			}
 			<-limitChan
@@ -95,9 +154,26 @@ func (d *Downloader) Start(concurrency int) error {
 		limitChan <- struct{}{}
 	}
 	wg.Wait()
-	if err := d.merge(); err != nil {
+
+	// signal reporter to finish and wait for it to drain
+	close(d.progress)
+	<-reporterDone
+	d.reporter.Event(Event{Type: EventDownloadDone})
+
+	tsFile, err := d.merge()
+	if err != nil {
 		return err
 	}
+	taskDone := Event{Type: EventTaskDone, TSFile: tsFile}
+	if d.convertToMP4 {
+		mp4File, err := d.convert(tsFile)
+		if err != nil {
+			return err
+		}
+		taskDone.MP4File = mp4File
+	}
+	d.reporter.Event(taskDone)
+	d.reporter.Close()
 	return nil
 }
 
@@ -108,7 +184,6 @@ func (d *Downloader) download(segIndex int) error {
 	if e != nil {
 		return fmt.Errorf("request %s, %s", tsUrl, e.Error())
 	}
-	//noinspection GoUnhandledErrorResult
 	defer b.Close()
 	fPath := filepath.Join(d.tsFolder, tsFilename)
 	fTemp := fPath + tsTempFileSuffix
@@ -132,10 +207,8 @@ func (d *Downloader) download(segIndex int) error {
 			return fmt.Errorf("decryt: %s, %s", tsUrl, err.Error())
 		}
 	}
-	// https://en.wikipedia.org/wiki/MPEG_transport_stream
-	// Some TS files do not start with SyncByte 0x47, they can not be played after merging,
-	// Need to remove the bytes before the SyncByte 0x47(71).
-	syncByte := uint8(71) //0x47
+	// Some TS files do not start with SyncByte 0x47; strip leading bytes before it.
+	syncByte := uint8(71) // 0x47
 	bLen := len(bytes)
 	for j := 0; j < bLen; j++ {
 		if bytes[j] == syncByte {
@@ -147,15 +220,16 @@ func (d *Downloader) download(segIndex int) error {
 	if _, err := w.Write(bytes); err != nil {
 		return fmt.Errorf("write to %s: %s", fTemp, err.Error())
 	}
-	// Release file resource to rename file
 	_ = f.Close()
 	if err = os.Rename(fTemp, fPath); err != nil {
 		return err
 	}
-	// Maybe it will be safer in this way...
 	atomic.AddInt32(&d.finish, 1)
-	//tool.DrawProgressBar("Downloading", float32(d.finish)/float32(d.segLen), progressWidth)
-	fmt.Printf("[download %6.2f%%] %s\n", float32(d.finish)/float32(d.segLen)*100, tsUrl)
+	// notify reporter (non-blocking: channel is buffered)
+	select {
+	case d.progress <- progressEvent(EventDownloadProgress, int(atomic.LoadInt32(&d.finish)), d.segLen):
+	default:
+	}
 	return nil
 }
 
@@ -168,7 +242,6 @@ func (d *Downloader) next() (segIndex int, end bool, err error) {
 			end = true
 			return
 		}
-		// Some segment indexes are still running.
 		end = false
 		return
 	}
@@ -187,8 +260,8 @@ func (d *Downloader) back(segIndex int) error {
 	return nil
 }
 
-func (d *Downloader) merge() error {
-	// In fact, the number of downloaded segments should be equal to number of m3u8 segments
+func (d *Downloader) merge() (string, error) {
+	d.reporter.Event(Event{Type: EventMergeStarted, Total: d.segLen})
 	missingCount := 0
 	for idx := 0; idx < d.segLen; idx++ {
 		tsFilename := tsFilename(idx)
@@ -198,16 +271,13 @@ func (d *Downloader) merge() error {
 		}
 	}
 	if missingCount > 0 {
-		fmt.Printf("[warning] %d files missing\n", missingCount)
+		d.reporter.Event(Event{Type: EventWarning, Message: fmt.Sprintf("%d files missing", missingCount)})
 	}
-
-	// Create a TS file for merging, all segment files will be written to this file.
-	mFilePath := filepath.Join(d.folder, mergeTSFilename)
+	mFilePath := filepath.Join(d.folder, d.filename)
 	mFile, err := os.Create(mFilePath)
 	if err != nil {
-		return fmt.Errorf("create main TS file failed：%s", err.Error())
+		return "", fmt.Errorf("create main TS file failed: %s", err.Error())
 	}
-	//noinspection GoUnhandledErrorResult
 	defer mFile.Close()
 
 	writer := bufio.NewWriter(mFile)
@@ -215,25 +285,80 @@ func (d *Downloader) merge() error {
 	for segIndex := 0; segIndex < d.segLen; segIndex++ {
 		tsFilename := tsFilename(segIndex)
 		bytes, err := ioutil.ReadFile(filepath.Join(d.tsFolder, tsFilename))
+		if err != nil {
+			continue
+		}
 		_, err = writer.Write(bytes)
 		if err != nil {
 			continue
 		}
 		mergedCount++
-		tool.DrawProgressBar("merge",
-			float32(mergedCount)/float32(d.segLen), progressWidth)
+		d.reporter.Event(progressEvent(EventMergeProgress, mergedCount, d.segLen))
 	}
 	_ = writer.Flush()
-	// Remove `ts` folder
 	_ = os.RemoveAll(d.tsFolder)
 
 	if mergedCount != d.segLen {
-		fmt.Printf("[warning] \n%d files merge failed", d.segLen-mergedCount)
+		d.reporter.Event(Event{Type: EventWarning, Message: fmt.Sprintf("%d files merge failed", d.segLen-mergedCount)})
 	}
+	d.reporter.Event(Event{Type: EventMergeDone, TSFile: mFilePath})
+	return mFilePath, nil
+}
 
-	fmt.Printf("\n[output] %s\n", mFilePath)
+func (d *Downloader) convert(tsFile string) (string, error) {
+	mp4File := mp4Filename(tsFile)
+	d.reporter.Event(Event{Type: EventConversionStarted, TSFile: tsFile, MP4File: mp4File})
+	if err := d.remuxer.RemuxTS(tsFile, mp4File); err != nil {
+		d.reporter.Event(Event{Type: EventConversionFailed, TSFile: tsFile, MP4File: mp4File, Message: err.Error()})
+		return "", err
+	}
+	expected := d.expectedDuration()
+	actual, err := d.prober.Duration(mp4File)
+	if err != nil {
+		d.reporter.Event(Event{Type: EventConversionFailed, TSFile: tsFile, MP4File: mp4File, Message: err.Error()})
+		return "", err
+	}
+	suspect := durationSuspect(expected, actual)
+	if suspect {
+		suspectFile := suspectMP4Filename(mp4File)
+		if err := os.Rename(mp4File, suspectFile); err != nil {
+			d.reporter.Event(Event{Type: EventConversionFailed, TSFile: tsFile, MP4File: mp4File, Message: err.Error()})
+			return "", err
+		}
+		mp4File = suspectFile
+		d.reporter.Event(Event{
+			Type:             EventConversionSuspect,
+			TSFile:           tsFile,
+			MP4File:          mp4File,
+			ExpectedDuration: expected,
+			ActualDuration:   actual,
+			Suspect:          true,
+			Message:          fmt.Sprintf("expected %.3fs, got %.3fs", expected, actual),
+		})
+	}
+	d.reporter.Event(Event{
+		Type:             EventConversionDone,
+		TSFile:           tsFile,
+		MP4File:          mp4File,
+		ExpectedDuration: expected,
+		ActualDuration:   actual,
+		Suspect:          suspect,
+	})
+	if suspect {
+		return mp4File, nil
+	}
+	if !d.keepTS {
+		d.cleanupTS(tsFile)
+	}
+	return mp4File, nil
+}
 
-	return nil
+func (d *Downloader) cleanupTS(tsFile string) {
+	if err := os.Remove(tsFile); err != nil {
+		d.reporter.Event(Event{Type: EventWarning, TSFile: tsFile, Message: fmt.Sprintf("remove TS file failed: %s", err.Error())})
+		return
+	}
+	d.reporter.Event(Event{Type: EventTSDeleted, TSFile: tsFile})
 }
 
 func (d *Downloader) tsURL(segIndex int) string {
@@ -241,8 +366,37 @@ func (d *Downloader) tsURL(segIndex int) string {
 	return tool.ResolveURL(d.result.URL, seg.URI)
 }
 
+func (d *Downloader) expectedDuration() float64 {
+	if d.result == nil || d.result.M3u8 == nil {
+		return 0
+	}
+	var total float64
+	for _, segment := range d.result.M3u8.Segments {
+		if segment != nil {
+			total += float64(segment.Duration)
+		}
+	}
+	return total
+}
+
 func tsFilename(ts int) string {
 	return strconv.Itoa(ts) + tsExt
+}
+
+func taskTimestamp() string {
+	return time.Now().Format(defaultTimeLayout)
+}
+
+func outputFilename(name string, defaultName string) string {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		name = defaultName
+	}
+	name = filepath.Base(name)
+	if filepath.Ext(name) == tsExt {
+		return name
+	}
+	return name + tsExt
 }
 
 func genSlice(len int) []int {
@@ -251,4 +405,25 @@ func genSlice(len int) []int {
 		s = append(s, i)
 	}
 	return s
+}
+
+func progressEvent(eventType string, done int, total int) Event {
+	var percent float64
+	if total > 0 {
+		percent = float64(done) / float64(total) * 100
+	}
+	return Event{
+		Type:    eventType,
+		Done:    done,
+		Total:   total,
+		Percent: percent,
+	}
+}
+
+func segmentFailedEvent(segment int, message string) Event {
+	return Event{
+		Type:    EventSegmentFailed,
+		Segment: &segment,
+		Message: message,
+	}
 }
