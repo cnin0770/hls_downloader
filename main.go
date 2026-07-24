@@ -8,9 +8,9 @@ import (
 	"io"
 	"os"
 
-	"github.com/cnin0770/m3u8_ui/config"
-	"github.com/cnin0770/m3u8_ui/dl"
-	"github.com/cnin0770/m3u8_ui/tool"
+	"github.com/cnin0770/hls_downloader/config"
+	"github.com/cnin0770/hls_downloader/dl"
+	"github.com/cnin0770/hls_downloader/tool"
 )
 
 var (

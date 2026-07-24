@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 )
 
-const appSupportFolder = "M3U8"
+const appSupportFolder = "HLS Downloader"
 
 type Config struct {
 	DownloadDir  string `json:"downloadDir"`

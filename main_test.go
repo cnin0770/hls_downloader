@@ -6,8 +6,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/cnin0770/m3u8_ui/config"
-	"github.com/cnin0770/m3u8_ui/dl"
+	"github.com/cnin0770/hls_downloader/config"
+	"github.com/cnin0770/hls_downloader/dl"
 )
 
 func TestApplyFlagOverrides(t *testing.T) {

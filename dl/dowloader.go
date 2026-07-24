@@ -13,8 +13,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/cnin0770/m3u8_ui/parse"
-	"github.com/cnin0770/m3u8_ui/tool"
+	"github.com/cnin0770/hls_downloader/parse"
+	"github.com/cnin0770/hls_downloader/tool"
 )
 
 const (

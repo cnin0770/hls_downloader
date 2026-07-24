@@ -9,7 +9,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/cnin0770/m3u8_ui/parse"
+	"github.com/cnin0770/hls_downloader/parse"
 )
 
 func TestFFmpegRemuxerBuildsCommand(t *testing.T) {
