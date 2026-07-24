@@ -56,8 +56,8 @@ func TestFFprobeDurationProberMissingFFprobe(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error")
 	}
-	if !strings.Contains(err.Error(), "ffprobe not found") {
-		t.Fatalf("error = %q, want ffprobe not found", err.Error())
+	if !strings.Contains(err.Error(), conversionToolMissing) {
+		t.Fatalf("error = %q, want %q", err.Error(), conversionToolMissing)
 	}
 }
 
@@ -112,8 +112,27 @@ func TestDurationSuspect(t *testing.T) {
 }
 
 func TestSuspectMP4Filename(t *testing.T) {
-	got := suspectMP4Filename("/tmp/movie.mp4")
-	if got != "/tmp/movie.suspect.mp4" {
-		t.Fatalf("suspectMP4Filename = %q, want /tmp/movie.suspect.mp4", got)
+	got := suspectMP4Filename("/tmp/movie.mp4", 3*3600+6*60+34)
+	if got != "/tmp/movie.030634.mp4" {
+		t.Fatalf("suspectMP4Filename = %q, want /tmp/movie.030634.mp4", got)
+	}
+}
+
+func TestDurationTag(t *testing.T) {
+	tests := []struct {
+		name     string
+		duration float64
+		want     string
+	}{
+		{name: "hours minutes seconds", duration: 3*3600 + 6*60 + 34, want: "030634"},
+		{name: "whole minute", duration: 3*3600 + 6*60, want: "030600"},
+		{name: "rounds to nearest second", duration: 3*3600 + 6*60 + 34.6, want: "030635"},
+	}
+
+	for _, tt := range tests {
+		got := durationTag(tt.duration)
+		if got != tt.want {
+			t.Fatalf("%s: durationTag(%v) = %q, want %q", tt.name, tt.duration, got, tt.want)
+		}
 	}
 }

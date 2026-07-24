@@ -5,7 +5,10 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strconv"
 	"strings"
+	"time"
+	"unicode/utf8"
 )
 
 const (
@@ -41,6 +44,12 @@ type Event struct {
 	ExpectedDuration float64 `json:"expected_duration,omitempty"`
 	ActualDuration   float64 `json:"actual_duration,omitempty"`
 	Suspect          bool    `json:"suspect,omitempty"`
+	ElapsedSeconds   float64 `json:"elapsed_seconds,omitempty"`
+	DownloadSeconds  float64 `json:"download_seconds,omitempty"`
+	BytesDownloaded  int64   `json:"bytes_downloaded,omitempty"`
+	FileSize         int64   `json:"file_size,omitempty"`
+	AverageSpeed     float64 `json:"average_speed,omitempty"`
+	Speed            float64 `json:"speed,omitempty"`
 }
 
 type Reporter interface {
@@ -49,8 +58,9 @@ type Reporter interface {
 }
 
 type HumanReporter struct {
-	writer io.Writer
-	errors []string
+	writer    io.Writer
+	errors    []string
+	lastSpeed float64
 }
 
 func NewHumanReporter(writer io.Writer) *HumanReporter {
@@ -63,8 +73,14 @@ func NewHumanReporter(writer io.Writer) *HumanReporter {
 func (r *HumanReporter) Event(ev Event) {
 	switch ev.Type {
 	case EventDownloadProgress:
-		drawBar(r.writer, "Downloading", ev.Percent/100, progressWidth,
-			fmt.Sprintf("%d/%d", ev.Done, ev.Total))
+		if ev.Speed > 0 {
+			r.lastSpeed = ev.Speed
+		}
+		suffix := fmt.Sprintf("%d/%d", ev.Done, ev.Total)
+		if r.lastSpeed > 0 {
+			suffix += "  " + humanizeSpeed(r.lastSpeed)
+		}
+		drawBar(r.writer, "Downloading", ev.Percent/100, progressWidth, suffix)
 	case EventSegmentFailed:
 		r.errors = append(r.errors, ev.Message)
 	case EventDownloadDone:
@@ -88,9 +104,21 @@ func (r *HumanReporter) Event(ev Event) {
 		fmt.Fprintf(r.writer, "[conversion suspect] %s\n", ev.Message)
 	case EventTSDeleted:
 		fmt.Fprintf(r.writer, "[cleanup] removed %s\n", ev.TSFile)
+	case EventTaskDone:
+		r.printSummary(ev)
 	case EventError:
 		fmt.Fprintf(r.writer, "[error] %s\n", ev.Message)
 	}
+}
+
+func (r *HumanReporter) printSummary(ev Event) {
+	if ev.ElapsedSeconds == 0 && ev.BytesDownloaded == 0 && ev.FileSize == 0 {
+		return
+	}
+	fmt.Fprintf(r.writer, "[summary] time %s | size %s | avg %s\n",
+		humanizeDuration(ev.ElapsedSeconds),
+		humanizeBytes(ev.FileSize),
+		humanizeSpeed(ev.AverageSpeed))
 }
 
 func (r *HumanReporter) Close() {}
@@ -114,8 +142,142 @@ func (r *JSONReporter) Event(ev Event) {
 
 func (r *JSONReporter) Close() {}
 
-func drawBar(writer io.Writer, prefix string, proportion float64, width int, suffix string) {
-	pos := int(proportion * float64(width))
-	bar := strings.Repeat("■", pos) + strings.Repeat(" ", width-pos)
-	fmt.Fprintf(writer, "\r[%s] [%s] %6.2f%% %s", prefix, bar, proportion*100, suffix)
+func humanizeDuration(seconds float64) string {
+	if seconds <= 0 {
+		return "0s"
+	}
+	d := time.Duration(seconds * float64(time.Second))
+	if d < time.Second {
+		return d.Round(time.Millisecond).String()
+	}
+	return d.Round(100 * time.Millisecond).String()
+}
+
+func humanizeBytes(n int64) string {
+	if n <= 0 {
+		return "0 B"
+	}
+	const unit = 1024
+	if n < unit {
+		return fmt.Sprintf("%d B", n)
+	}
+	div, exp := int64(unit), 0
+	for m := n / unit; m >= unit; m /= unit {
+		div *= unit
+		exp++
+	}
+	units := []string{"KB", "MB", "GB", "TB", "PB"}
+	return fmt.Sprintf("%.2f %s", float64(n)/float64(div), units[exp])
+}
+
+func humanizeSpeed(bytesPerSecond float64) string {
+	if bytesPerSecond <= 0 {
+		return "0 B/s"
+	}
+	return humanizeBytes(int64(bytesPerSecond)) + "/s"
+}
+
+func drawBar(writer io.Writer, prefix string, proportion float64, barWidth int, suffix string) {
+	cols := terminalWidth(writer)
+	line := renderBar(prefix, proportion, barWidth, suffix, cols)
+	if cols > 0 {
+		// The line is sized to fit the terminal, so it never wraps onto extra
+		// rows; \033[K clears any leftovers from a previous, longer line.
+		fmt.Fprintf(writer, "\r%s\033[K", line)
+		return
+	}
+	fmt.Fprintf(writer, "\r%s", line)
+}
+
+// renderBar builds the status line, sized to fit cols columns (cols <= 0 means
+// unlimited). It shrinks the bar first, then falls back to an ellipsis-truncated
+// text line, so a narrow terminal never wraps the status onto multiple rows.
+func renderBar(prefix string, proportion float64, barWidth int, suffix string, cols int) string {
+	if proportion < 0 {
+		proportion = 0
+	}
+	if proportion > 1 {
+		proportion = 1
+	}
+	head := fmt.Sprintf("[%s] ", prefix)
+	tail := fmt.Sprintf("%6.2f%%", proportion*100)
+	if suffix != "" {
+		tail += " " + suffix
+	}
+	if cols > 0 {
+		budget := cols - 1
+		if budget < 1 {
+			budget = 1
+		}
+		// A bar narrower than this conveys almost nothing, so below it we drop
+		// the bar entirely rather than show a 1-2 cell stub.
+		const minBar = 4
+		// fixed chars around the bar contents: "[" plus "] "
+		fixed := utf8.RuneCountInString(head) + 3 + utf8.RuneCountInString(tail)
+		avail := budget - fixed
+		if avail < minBar {
+			return compactLine(prefix, proportion, suffix, budget)
+		}
+		if avail < barWidth {
+			barWidth = avail
+		}
+	}
+	if barWidth < 0 {
+		barWidth = 0
+	}
+	pos := int(proportion * float64(barWidth))
+	if pos > barWidth {
+		pos = barWidth
+	}
+	bar := strings.Repeat("■", pos) + strings.Repeat(" ", barWidth-pos)
+	return head + "[" + bar + "] " + tail
+}
+
+// compactLine renders a bar-less status for terminals too narrow to fit a
+// useful bar. It keeps the most informative fields, first dropping the phase
+// label, and only ellipsis-truncates when even that will not fit.
+func compactLine(prefix string, proportion float64, suffix string, budget int) string {
+	parts := fmt.Sprintf("%.2f%%", proportion*100)
+	if suffix != "" {
+		parts += " " + suffix
+	}
+	if withPrefix := prefix + " " + parts; utf8.RuneCountInString(withPrefix) <= budget {
+		return withPrefix
+	}
+	if utf8.RuneCountInString(parts) <= budget {
+		return parts
+	}
+	return truncateRunes(parts, budget)
+}
+
+// truncateRunes shortens s to at most max display columns, marking a cut with an
+// ellipsis. It counts runes rather than bytes so multi-byte characters are not
+// split mid-encoding.
+func truncateRunes(s string, max int) string {
+	if max <= 0 {
+		return ""
+	}
+	if utf8.RuneCountInString(s) <= max {
+		return s
+	}
+	if max == 1 {
+		return "…"
+	}
+	runes := []rune(s)
+	return string(runes[:max-1]) + "…"
+}
+
+// terminalWidth reports the column count when writer is a terminal, else 0.
+func terminalWidth(writer io.Writer) int {
+	f, ok := writer.(*os.File)
+	if !ok {
+		return 0
+	}
+	if w := terminalWidthFD(f.Fd()); w > 0 {
+		return w
+	}
+	if cols, err := strconv.Atoi(os.Getenv("COLUMNS")); err == nil && cols > 0 {
+		return cols
+	}
+	return 0
 }

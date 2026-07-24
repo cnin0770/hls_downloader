@@ -3,6 +3,7 @@ package dl
 import (
 	"bufio"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"os"
 	"path/filepath"
@@ -31,6 +32,7 @@ type Downloader struct {
 	filename string
 	finish   int32
 	segLen   int
+	bytes    int64
 
 	result   *parse.Result
 	progress chan Event // all goroutines send here; reporter owns stdout
@@ -112,6 +114,7 @@ func (d *Downloader) SetDurationProber(prober DurationProber) {
 // Start runs the downloader with a concurrent progress bar.
 func (d *Downloader) Start(concurrency int) error {
 	var wg sync.WaitGroup
+	taskStart := time.Now()
 
 	// --- reporter goroutine: sole owner of stdout during download ---
 	reporterDone := make(chan struct{})
@@ -129,6 +132,41 @@ func (d *Downloader) Start(concurrency int) error {
 		Total:            d.segLen,
 		ExpectedDuration: d.expectedDuration(),
 	})
+
+	// --- live speed sampler: periodically emits a download_progress event
+	// carrying the current download speed (bytes in the last interval), so the
+	// progress bar keeps a fresh speed even between segment completions.
+	sampleStop := make(chan struct{})
+	sampleStopped := make(chan struct{})
+	go func() {
+		defer close(sampleStopped)
+		const interval = time.Second
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		lastTime := taskStart
+		lastBytes := int64(0)
+		for {
+			select {
+			case <-sampleStop:
+				return
+			case now := <-ticker.C:
+				curBytes := atomic.LoadInt64(&d.bytes)
+				dt := now.Sub(lastTime).Seconds()
+				var speed float64
+				if dt > 0 {
+					speed = float64(curBytes-lastBytes) / dt
+				}
+				lastTime, lastBytes = now, curBytes
+				done := int(atomic.LoadInt32(&d.finish))
+				ev := progressEvent(EventDownloadProgress, done, d.segLen)
+				ev.Speed = speed
+				select {
+				case d.progress <- ev:
+				default:
+				}
+			}
+		}
+	}()
 
 	// --- download workers ---
 	limitChan := make(chan struct{}, concurrency)
@@ -154,6 +192,12 @@ func (d *Downloader) Start(concurrency int) error {
 		limitChan <- struct{}{}
 	}
 	wg.Wait()
+	downloadElapsed := time.Since(taskStart)
+
+	// stop the sampler and wait for it to exit before closing d.progress,
+	// so it can never send on a closed channel.
+	close(sampleStop)
+	<-sampleStopped
 
 	// signal reporter to finish and wait for it to drain
 	close(d.progress)
@@ -172,9 +216,30 @@ func (d *Downloader) Start(concurrency int) error {
 		}
 		taskDone.MP4File = mp4File
 	}
+	d.fillSummary(&taskDone, taskStart, downloadElapsed)
 	d.reporter.Event(taskDone)
 	d.reporter.Close()
 	return nil
+}
+
+// fillSummary populates the task_done event with timing, size and throughput
+// stats. Average speed is measured over the download phase only, since merge
+// and conversion do not use the network.
+func (d *Downloader) fillSummary(ev *Event, taskStart time.Time, downloadElapsed time.Duration) {
+	downloaded := atomic.LoadInt64(&d.bytes)
+	ev.BytesDownloaded = downloaded
+	ev.ElapsedSeconds = time.Since(taskStart).Seconds()
+	ev.DownloadSeconds = downloadElapsed.Seconds()
+	if downloadElapsed > 0 {
+		ev.AverageSpeed = float64(downloaded) / downloadElapsed.Seconds()
+	}
+	finalFile := ev.TSFile
+	if ev.MP4File != "" {
+		finalFile = ev.MP4File
+	}
+	if info, err := os.Stat(finalFile); err == nil {
+		ev.FileSize = info.Size()
+	}
 }
 
 func (d *Downloader) download(segIndex int) error {
@@ -191,7 +256,9 @@ func (d *Downloader) download(segIndex int) error {
 	if err != nil {
 		return fmt.Errorf("create file: %s, %s", tsFilename, err.Error())
 	}
-	bytes, err := ioutil.ReadAll(b)
+	// Count bytes as they stream (not once at completion) so the live speed
+	// sampler sees real throughput even mid-segment.
+	bytes, err := ioutil.ReadAll(&countingReader{reader: b, counter: &d.bytes})
 	if err != nil {
 		return fmt.Errorf("read bytes: %s, %s", tsUrl, err.Error())
 	}
@@ -238,7 +305,9 @@ func (d *Downloader) next() (segIndex int, end bool, err error) {
 	defer d.lock.Unlock()
 	if len(d.queue) == 0 {
 		err = fmt.Errorf("queue empty")
-		if d.finish == int32(d.segLen) {
+		// d.finish is updated atomically by worker goroutines that do not hold
+		// d.lock, so it must be read atomically here too.
+		if atomic.LoadInt32(&d.finish) == int32(d.segLen) {
 			end = true
 			return
 		}
@@ -320,7 +389,7 @@ func (d *Downloader) convert(tsFile string) (string, error) {
 	}
 	suspect := durationSuspect(expected, actual)
 	if suspect {
-		suspectFile := suspectMP4Filename(mp4File)
+		suspectFile := suspectMP4Filename(mp4File, expected)
 		if err := os.Rename(mp4File, suspectFile); err != nil {
 			d.reporter.Event(Event{Type: EventConversionFailed, TSFile: tsFile, MP4File: mp4File, Message: err.Error()})
 			return "", err
@@ -377,6 +446,22 @@ func (d *Downloader) expectedDuration() float64 {
 		}
 	}
 	return total
+}
+
+// countingReader wraps an io.Reader and adds the number of bytes read to a
+// shared atomic counter, so download throughput can be sampled while segments
+// are still in flight.
+type countingReader struct {
+	reader  io.Reader
+	counter *int64
+}
+
+func (c *countingReader) Read(p []byte) (int, error) {
+	n, err := c.reader.Read(p)
+	if n > 0 {
+		atomic.AddInt64(c.counter, int64(n))
+	}
+	return n, err
 }
 
 func tsFilename(ts int) string {

@@ -7,7 +7,11 @@
 *.so
 *.dylib
 /bin
+/dist
 /patched
+/macos
+# macOS app packaging script (belongs with the /macos SwiftUI shell WIP)
+/scripts/package_app.sh
 
 # Test binary, built with `go test -c`
 *.test

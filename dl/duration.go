@@ -13,7 +13,7 @@ import (
 const (
 	durationToleranceSeconds = 5.0
 	durationToleranceRatio   = 0.01
-	suspectSuffix            = ".suspect"
+	conversionToolMissing    = "MP4 conversion requires local ffmpeg. Please install it and try again."
 )
 
 type DurationProber interface {
@@ -59,7 +59,7 @@ func (p FFprobeDurationProber) binary() (string, error) {
 	}
 	binary, err := lookPath("ffprobe")
 	if err != nil {
-		return "", fmt.Errorf("ffprobe not found; install it and try again")
+		return "", fmt.Errorf(conversionToolMissing)
 	}
 	return binary, nil
 }
@@ -103,10 +103,22 @@ func durationSuspect(expected float64, actual float64) bool {
 	return math.Abs(expected-actual) > durationTolerance(expected)
 }
 
-func suspectMP4Filename(mp4Path string) string {
+func suspectMP4Filename(mp4Path string, expected float64) string {
+	suffix := "." + durationTag(expected)
 	ext := filepath.Ext(mp4Path)
 	if strings.EqualFold(ext, ".mp4") {
-		return strings.TrimSuffix(mp4Path, ext) + suspectSuffix + ".mp4"
+		return strings.TrimSuffix(mp4Path, ext) + suffix + ".mp4"
 	}
-	return mp4Path + suspectSuffix
+	return mp4Path + suffix
+}
+
+func durationTag(duration float64) string {
+	totalSeconds := int(math.Round(duration))
+	if totalSeconds < 0 {
+		totalSeconds = 0
+	}
+	hours := totalSeconds / 3600
+	minutes := (totalSeconds % 3600) / 60
+	seconds := totalSeconds % 60
+	return fmt.Sprintf("%02d%02d%02d", hours, minutes, seconds)
 }

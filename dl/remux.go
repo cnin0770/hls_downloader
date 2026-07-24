@@ -48,7 +48,7 @@ func (r FFmpegRemuxer) binary() (string, error) {
 	}
 	binary, err := lookPath("ffmpeg")
 	if err != nil {
-		return "", fmt.Errorf("ffmpeg not found; install it and try again")
+		return "", fmt.Errorf(conversionToolMissing)
 	}
 	return binary, nil
 }

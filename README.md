@@ -97,6 +97,24 @@ error
 task_done
 ```
 
+During the download, the progress bar shows a live download speed (sampled once per second) alongside the segment count:
+
+```text
+[Downloading] [■■■■■■■■■■■■■■■               ]  50.00% 4/8  1.61 MB/s
+```
+
+The progress bar adapts to the terminal width so it never wraps onto multiple rows: on a narrow window the bar shrinks, on a very narrow one the bar is dropped and only the key fields are shown (e.g. `50.00% 4/8`), and in the extreme case the line is truncated with an ellipsis.
+
+In JSON mode, `download_progress` events carry the current `speed` (bytes per second) roughly once per second.
+
+When a task completes, a summary line reports the total time, output file size, and average download speed:
+
+```text
+[summary] time 1m23.4s | size 256.40 MB | avg 6.30 MB/s
+```
+
+Average speed is measured over the download phase only (merging and MP4 conversion do not use the network). In JSON mode these values are carried on the `task_done` event as `elapsed_seconds`, `download_seconds`, `bytes_downloaded`, `file_size`, and `average_speed` (the JSON event still includes `bytes_downloaded`, which counts retried segments as bandwidth used).
+
 The CLI exits with code `0` on success and code `1` on failure. In JSON mode, failures emit an `error` event.
 
 ### binary:

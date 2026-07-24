@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/cnin0770/m3u8_ui/parse"
@@ -51,8 +52,8 @@ func TestFFmpegRemuxerMissingFFmpeg(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error")
 	}
-	if !strings.Contains(err.Error(), "ffmpeg not found") {
-		t.Fatalf("error = %q, want ffmpeg not found", err.Error())
+	if !strings.Contains(err.Error(), conversionToolMissing) {
+		t.Fatalf("error = %q, want %q", err.Error(), conversionToolMissing)
 	}
 }
 
@@ -99,14 +100,27 @@ func (r *fakeRemuxer) RemuxTS(input string, output string) error {
 }
 
 type recordingReporter struct {
+	mu     sync.Mutex
 	events []Event
 }
 
 func (r *recordingReporter) Event(ev Event) {
+	r.mu.Lock()
 	r.events = append(r.events, ev)
+	r.mu.Unlock()
 }
 
 func (r *recordingReporter) Close() {}
+
+// snapshot returns a copy of the recorded events, safe to read after a
+// concurrent download run.
+func (r *recordingReporter) snapshot() []Event {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]Event, len(r.events))
+	copy(out, r.events)
+	return out
+}
 
 type fakeDurationProber struct {
 	duration float64
@@ -230,8 +244,8 @@ func TestConvertMarksSuspectAndKeepsTS(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if mp4File != filepath.Join(dir, "movie.suspect.mp4") {
-		t.Fatalf("mp4File = %q, want movie.suspect.mp4", mp4File)
+	if mp4File != filepath.Join(dir, "movie.000140.mp4") {
+		t.Fatalf("mp4File = %q, want movie.000140.mp4", mp4File)
 	}
 	if _, err := os.Stat(tsFile); err != nil {
 		t.Fatalf("TS file should be kept after suspect conversion: %s", err)
