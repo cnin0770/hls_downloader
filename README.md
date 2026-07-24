@@ -110,12 +110,17 @@ In JSON mode, successful TS cleanup emits a `ts_deleted` event.
 
 ### Progress, live speed, and summary
 
-During the download, the progress bar shows a live download speed (sampled once per
-second) alongside the segment count:
+During the download, the progress bar shows a live download speed, an estimated final
+size, and an ETA (all sampled once per second) alongside the segment count:
 
 ```text
-[Downloading] [■■■■■■■■■■■■■■■               ]  50.00% 4/8  1.61 MB/s
+[Downloading] [■■■■■■■■■■■■■■■          ]  50.00% 4/8  1.61 MB/s  ~256.40 MB  ETA 2:05
 ```
+
+The size estimate extrapolates from the segments finished so far, weighted by playlist
+duration rather than segment count so it tracks variable-bitrate streams. It is marked
+`~` because it is a projection: if the stream's bitrate ramps up later, early estimates
+read low and converge as the download proceeds.
 
 The progress bar adapts to the terminal width so it never wraps onto multiple rows: on
 a narrow window the bar shrinks, on a very narrow one the bar is dropped and only the
@@ -134,8 +139,9 @@ not use the network).
 
 ### JSON events
 
-In JSON mode, `download_progress` events carry the current `speed` (bytes per second)
-roughly once per second, and the summary values ride on the `task_done` event as
+In JSON mode, `download_progress` events carry the current `speed` (bytes per second),
+`estimated_bytes`, and `eta_seconds` roughly once per second, and the summary values
+ride on the `task_done` event as
 `elapsed_seconds`, `download_seconds`, `bytes_downloaded`, `file_size`, and
 `average_speed` (`bytes_downloaded` counts retried segments as bandwidth used).
 
@@ -175,14 +181,6 @@ Windows PowerShell:
 ```
 .\hlsdl.exe -u="http://example.com/index.m3u8" -o="D:\data\example"
 ```
-
-## Download
-
-[Binary packages](https://github.com/cnin0770/hls_downloader/releases)
-
-## Screenshots
-
-![Demo](./screenshots/demo.gif)
 
 ## Acknowledgments
 

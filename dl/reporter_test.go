@@ -99,6 +99,45 @@ func TestHumanReporterKeepsLastSpeedBetweenTicks(t *testing.T) {
 	}
 }
 
+func TestHumanReporterShowsEstimateAndETA(t *testing.T) {
+	var buf bytes.Buffer
+	reporter := NewHumanReporter(&buf)
+
+	ev := progressEvent(EventDownloadProgress, 2, 8)
+	ev.Speed = 2 * 1024 * 1024
+	ev.EstimatedBytes = 256 * 1024 * 1024
+	ev.ETASeconds = 125
+
+	reporter.Event(ev)
+
+	output := buf.String()
+	for _, want := range []string{"~256.00 MB", "ETA 2:05"} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("output = %q, want %q", output, want)
+		}
+	}
+}
+
+func TestFormatETA(t *testing.T) {
+	tests := []struct {
+		seconds float64
+		want    string
+	}{
+		{0, ""},
+		{-5, ""},
+		{0.3, "0:01"}, // sub-second remainders round up, never to "0:00"
+		{42, "0:42"},
+		{125, "2:05"},
+		{3725, "1:02:05"},
+		{25 * 60 * 60, ""}, // absurd values are not quoted
+	}
+	for _, tt := range tests {
+		if got := formatETA(tt.seconds); got != tt.want {
+			t.Fatalf("formatETA(%v) = %q, want %q", tt.seconds, got, tt.want)
+		}
+	}
+}
+
 func TestHumanReporterPrintsSummary(t *testing.T) {
 	var buf bytes.Buffer
 	reporter := NewHumanReporter(&buf)

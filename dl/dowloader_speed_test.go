@@ -66,10 +66,22 @@ func TestLiveSpeedSampledMidDownload(t *testing.T) {
 	}
 
 	var sawLiveSpeed bool
+	var sawEstimate bool
+	var sawETA bool
+	var estimates []int64
 	var done Event
 	for _, ev := range rec.snapshot() {
-		if ev.Type == EventDownloadProgress && ev.Speed > 0 {
-			sawLiveSpeed = true
+		if ev.Type == EventDownloadProgress {
+			if ev.Speed > 0 {
+				sawLiveSpeed = true
+			}
+			if ev.EstimatedBytes > 0 {
+				sawEstimate = true
+				estimates = append(estimates, ev.EstimatedBytes)
+			}
+			if ev.ETASeconds > 0 {
+				sawETA = true
+			}
 		}
 		if ev.Type == EventTaskDone {
 			done = ev
@@ -78,6 +90,20 @@ func TestLiveSpeedSampledMidDownload(t *testing.T) {
 
 	if !sawLiveSpeed {
 		t.Fatal("expected at least one download_progress event carrying Speed > 0")
+	}
+	if !sawEstimate {
+		t.Fatal("expected at least one download_progress event carrying EstimatedBytes > 0")
+	}
+	if !sawETA {
+		t.Fatal("expected at least one download_progress event carrying ETASeconds > 0")
+	}
+	// Every segment here is the same size, so the estimate should land close to
+	// the real total rather than merely being non-zero.
+	total := int64(6 * 256 * 1024)
+	for _, estimate := range estimates {
+		if estimate < total/2 || estimate > total*2 {
+			t.Fatalf("estimate %d is not within 2x of actual total %d", estimate, total)
+		}
 	}
 	if done.BytesDownloaded <= 0 {
 		t.Fatalf("task_done bytes_downloaded = %d, want > 0", done.BytesDownloaded)

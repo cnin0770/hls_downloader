@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"strconv"
 	"strings"
@@ -50,6 +51,8 @@ type Event struct {
 	FileSize         int64   `json:"file_size,omitempty"`
 	AverageSpeed     float64 `json:"average_speed,omitempty"`
 	Speed            float64 `json:"speed,omitempty"`
+	EstimatedBytes   int64   `json:"estimated_bytes,omitempty"`
+	ETASeconds       float64 `json:"eta_seconds,omitempty"`
 }
 
 type Reporter interface {
@@ -58,9 +61,11 @@ type Reporter interface {
 }
 
 type HumanReporter struct {
-	writer    io.Writer
-	errors    []string
-	lastSpeed float64
+	writer       io.Writer
+	errors       []string
+	lastSpeed    float64
+	lastEstimate int64
+	lastETA      float64
 }
 
 func NewHumanReporter(writer io.Writer) *HumanReporter {
@@ -73,12 +78,26 @@ func NewHumanReporter(writer io.Writer) *HumanReporter {
 func (r *HumanReporter) Event(ev Event) {
 	switch ev.Type {
 	case EventDownloadProgress:
+		// Sampler ticks carry live figures; worker redraws in between do not, so
+		// the last known values are kept to avoid the line flickering.
 		if ev.Speed > 0 {
 			r.lastSpeed = ev.Speed
+		}
+		if ev.EstimatedBytes > 0 {
+			r.lastEstimate = ev.EstimatedBytes
+		}
+		if ev.ETASeconds > 0 {
+			r.lastETA = ev.ETASeconds
 		}
 		suffix := fmt.Sprintf("%d/%d", ev.Done, ev.Total)
 		if r.lastSpeed > 0 {
 			suffix += "  " + humanizeSpeed(r.lastSpeed)
+		}
+		if r.lastEstimate > 0 {
+			suffix += "  ~" + humanizeBytes(r.lastEstimate)
+		}
+		if eta := formatETA(r.lastETA); eta != "" {
+			suffix += "  ETA " + eta
 		}
 		drawBar(r.writer, "Downloading", ev.Percent/100, progressWidth, suffix)
 	case EventSegmentFailed:
@@ -168,6 +187,26 @@ func humanizeBytes(n int64) string {
 	}
 	units := []string{"KB", "MB", "GB", "TB", "PB"}
 	return fmt.Sprintf("%.2f %s", float64(n)/float64(div), units[exp])
+}
+
+// formatETA renders remaining time as m:ss (or h:mm:ss), the compact form
+// download tools conventionally use. It returns "" when there is nothing
+// meaningful to show, and refuses to quote absurd values from a stalled start.
+func formatETA(seconds float64) string {
+	const maxETA = 24 * 60 * 60
+	if seconds <= 0 || seconds > maxETA {
+		return ""
+	}
+	// Round up: while any bytes remain, "0:01" is honest where "0:00" would
+	// read as already finished.
+	total := int(math.Ceil(seconds))
+	hours := total / 3600
+	minutes := (total % 3600) / 60
+	secs := total % 60
+	if hours > 0 {
+		return fmt.Sprintf("%d:%02d:%02d", hours, minutes, secs)
+	}
+	return fmt.Sprintf("%d:%02d", minutes, secs)
 }
 
 func humanizeSpeed(bytesPerSecond float64) string {

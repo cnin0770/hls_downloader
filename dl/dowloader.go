@@ -33,6 +33,8 @@ type Downloader struct {
 	finish   int32
 	segLen   int
 	bytes    int64
+	doneMS   int64 // playlist duration of completed segments, in milliseconds
+	doneB    int64 // bytes written by completed segments
 
 	result   *parse.Result
 	progress chan Event // all goroutines send here; reporter owns stdout
@@ -138,6 +140,7 @@ func (d *Downloader) Start(concurrency int) error {
 	// progress bar keeps a fresh speed even between segment completions.
 	sampleStop := make(chan struct{})
 	sampleStopped := make(chan struct{})
+	totalDuration := d.expectedDuration()
 	go func() {
 		defer close(sampleStopped)
 		const interval = time.Second
@@ -160,6 +163,15 @@ func (d *Downloader) Start(concurrency int) error {
 				done := int(atomic.LoadInt32(&d.finish))
 				ev := progressEvent(EventDownloadProgress, done, d.segLen)
 				ev.Speed = speed
+				doneDuration := float64(atomic.LoadInt64(&d.doneMS)) / 1000
+				fraction := completedFraction(doneDuration, totalDuration, done, d.segLen)
+				// Extrapolate from completed segments only (see doneB/doneMS).
+				ev.EstimatedBytes = extrapolateTotalBytes(atomic.LoadInt64(&d.doneB), fraction)
+				// ETA uses the average speed since the task started rather than
+				// the last interval: it is far steadier on bursty connections.
+				if elapsed := now.Sub(taskStart).Seconds(); elapsed > 0 {
+					ev.ETASeconds = estimateETASeconds(ev.EstimatedBytes-curBytes, float64(curBytes)/elapsed)
+				}
 				select {
 				case d.progress <- ev:
 				default:
@@ -292,6 +304,11 @@ func (d *Downloader) download(segIndex int) error {
 		return err
 	}
 	atomic.AddInt32(&d.finish, 1)
+	// Track completed segments' written size alongside their playlist duration.
+	// Both counters advance together, so the size estimate is not skewed by
+	// bytes from segments that are still in flight.
+	atomic.AddInt64(&d.doneB, int64(len(bytes)))
+	atomic.AddInt64(&d.doneMS, int64(float64(sf.Duration)*1000))
 	// notify reporter (non-blocking: channel is buffered)
 	select {
 	case d.progress <- progressEvent(EventDownloadProgress, int(atomic.LoadInt32(&d.finish)), d.segLen):
@@ -446,6 +463,48 @@ func (d *Downloader) expectedDuration() float64 {
 		}
 	}
 	return total
+}
+
+// completedFraction reports how much of the playlist is done, preferring
+// playlist duration over segment counts: segments vary in length, so weighting
+// by duration tracks a variable-bitrate stream far more closely than counting
+// files. It falls back to the segment count when durations are unavailable.
+func completedFraction(doneDuration float64, totalDuration float64, done int, total int) float64 {
+	var fraction float64
+	switch {
+	case doneDuration > 0 && totalDuration > 0:
+		fraction = doneDuration / totalDuration
+	case total > 0:
+		fraction = float64(done) / float64(total)
+	}
+	if fraction < 0 {
+		return 0
+	}
+	if fraction > 1 {
+		return 1
+	}
+	return fraction
+}
+
+// extrapolateTotalBytes estimates the final download size from the bytes seen so
+// far. It returns 0 while there is not yet enough data to guess responsibly.
+func extrapolateTotalBytes(bytesSoFar int64, fraction float64) int64 {
+	if bytesSoFar <= 0 || fraction <= 0 {
+		return 0
+	}
+	if fraction >= 1 {
+		return bytesSoFar
+	}
+	return int64(float64(bytesSoFar) / fraction)
+}
+
+// estimateETASeconds returns the seconds of download remaining at the given
+// speed, or 0 when it cannot be estimated.
+func estimateETASeconds(remainingBytes int64, speed float64) float64 {
+	if remainingBytes <= 0 || speed <= 0 {
+		return 0
+	}
+	return float64(remainingBytes) / speed
 }
 
 // countingReader wraps an io.Reader and adds the number of bytes read to a

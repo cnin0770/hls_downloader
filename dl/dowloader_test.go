@@ -7,6 +7,61 @@ import (
 	"github.com/cnin0770/hls_downloader/parse"
 )
 
+func TestCompletedFractionPrefersDuration(t *testing.T) {
+	// 30s of a 120s playlist is 25% done, even though 1 of 2 segments (50%)
+	// has finished — duration weighting is what makes the size estimate track
+	// a variable-bitrate stream.
+	got := completedFraction(30, 120, 1, 2)
+	if got != 0.25 {
+		t.Fatalf("completedFraction = %v, want 0.25", got)
+	}
+}
+
+func TestCompletedFractionFallsBackToSegmentCount(t *testing.T) {
+	got := completedFraction(0, 0, 3, 12)
+	if got != 0.25 {
+		t.Fatalf("completedFraction = %v, want 0.25", got)
+	}
+}
+
+func TestCompletedFractionClamps(t *testing.T) {
+	if got := completedFraction(200, 100, 0, 0); got != 1 {
+		t.Fatalf("completedFraction = %v, want clamp to 1", got)
+	}
+	if got := completedFraction(0, 0, 0, 0); got != 0 {
+		t.Fatalf("completedFraction = %v, want 0 with no data", got)
+	}
+}
+
+func TestExtrapolateTotalBytes(t *testing.T) {
+	if got := extrapolateTotalBytes(25*1024*1024, 0.25); got != 100*1024*1024 {
+		t.Fatalf("extrapolateTotalBytes = %d, want 100 MiB", got)
+	}
+	// Nothing downloaded yet, or no progress: refuse to guess.
+	if got := extrapolateTotalBytes(0, 0.5); got != 0 {
+		t.Fatalf("extrapolateTotalBytes = %d, want 0", got)
+	}
+	if got := extrapolateTotalBytes(1024, 0); got != 0 {
+		t.Fatalf("extrapolateTotalBytes = %d, want 0", got)
+	}
+	// Complete: the estimate is simply what was downloaded.
+	if got := extrapolateTotalBytes(4096, 1); got != 4096 {
+		t.Fatalf("extrapolateTotalBytes = %d, want 4096", got)
+	}
+}
+
+func TestEstimateETASeconds(t *testing.T) {
+	if got := estimateETASeconds(10*1024*1024, 1024*1024); got != 10 {
+		t.Fatalf("estimateETASeconds = %v, want 10", got)
+	}
+	if got := estimateETASeconds(0, 1024); got != 0 {
+		t.Fatalf("estimateETASeconds = %v, want 0 when nothing remains", got)
+	}
+	if got := estimateETASeconds(1024, 0); got != 0 {
+		t.Fatalf("estimateETASeconds = %v, want 0 when speed is unknown", got)
+	}
+}
+
 func TestOutputFilename(t *testing.T) {
 	tests := []struct {
 		name string
