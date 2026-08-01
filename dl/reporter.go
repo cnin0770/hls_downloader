@@ -89,17 +89,8 @@ func (r *HumanReporter) Event(ev Event) {
 		if ev.ETASeconds > 0 {
 			r.lastETA = ev.ETASeconds
 		}
-		suffix := fmt.Sprintf("%d/%d", ev.Done, ev.Total)
-		if r.lastSpeed > 0 {
-			suffix += "  " + humanizeSpeed(r.lastSpeed)
-		}
-		if r.lastEstimate > 0 {
-			suffix += "  ~" + humanizeBytes(r.lastEstimate)
-		}
-		if eta := formatETA(r.lastETA); eta != "" {
-			suffix += "  ETA " + eta
-		}
-		drawBar(r.writer, "Downloading", ev.Percent/100, progressWidth, suffix)
+		drawStatus(r.writer, statusLine("DL", ev.Percent/100,
+			r.lastEstimate, r.lastSpeed, r.lastETA, ev.Done, ev.Total))
 	case EventSegmentFailed:
 		r.errors = append(r.errors, ev.Message)
 	case EventDownloadDone:
@@ -108,7 +99,7 @@ func (r *HumanReporter) Event(ev Event) {
 			fmt.Fprintln(r.writer, err)
 		}
 	case EventMergeProgress:
-		drawBar(r.writer, "Merging", ev.Percent/100, progressWidth, "")
+		drawStatus(r.writer, statusLine("Merge", ev.Percent/100, 0, 0, 0, ev.Done, ev.Total))
 	case EventWarning:
 		fmt.Fprintf(r.writer, "\n[warning] %s", ev.Message)
 	case EventMergeDone:
@@ -172,7 +163,22 @@ func humanizeDuration(seconds float64) string {
 	return d.Round(100 * time.Millisecond).String()
 }
 
+// autoDecimals asks formatBytes to pick the precision from the unit.
+const autoDecimals = -1
+
+// humanizeBytes formats a known, measured size, where full precision is wanted.
 func humanizeBytes(n int64) string {
+	return formatBytes(n, 2)
+}
+
+// humanizeBytesRough formats a projected size. Decimals only earn their space
+// at GB and above — "1.9 GB" says something meaningfully different from "2 GB",
+// whereas the .3 in "9.3 MB" is noise on an estimate.
+func humanizeBytesRough(n int64) string {
+	return formatBytes(n, autoDecimals)
+}
+
+func formatBytes(n int64, decimals int) string {
 	if n <= 0 {
 		return "0 B"
 	}
@@ -186,7 +192,22 @@ func humanizeBytes(n int64) string {
 		exp++
 	}
 	units := []string{"KB", "MB", "GB", "TB", "PB"}
-	return fmt.Sprintf("%.2f %s", float64(n)/float64(div), units[exp])
+	if decimals == autoDecimals {
+		// exp 0=KB, 1=MB, 2=GB: keep a decimal from GB upwards.
+		if exp >= 2 {
+			decimals = 1
+		} else {
+			decimals = 0
+		}
+	}
+	return fmt.Sprintf("%.*f %s", decimals, float64(n)/float64(div), units[exp])
+}
+
+// formatPercent renders progress as a fixed-width whole percentage. It floors
+// rather than rounds so the line cannot read "100%" while work is still in
+// flight; two decimals were false precision on a progress bar.
+func formatPercent(proportion float64) string {
+	return fmt.Sprintf("%3.0f%%", math.Floor(proportion*100))
 }
 
 // formatETA renders remaining time as m:ss (or h:mm:ss), the compact form
@@ -209,84 +230,57 @@ func formatETA(seconds float64) string {
 	return fmt.Sprintf("%d:%02d", minutes, secs)
 }
 
+// humanizeSpeed formats a throughput. One decimal is plenty for a figure that
+// moves every second.
 func humanizeSpeed(bytesPerSecond float64) string {
 	if bytesPerSecond <= 0 {
 		return "0 B/s"
 	}
-	return humanizeBytes(int64(bytesPerSecond)) + "/s"
+	return formatBytes(int64(bytesPerSecond), 1) + "/s"
 }
 
-func drawBar(writer io.Writer, prefix string, proportion float64, barWidth int, suffix string) {
-	cols := terminalWidth(writer)
-	line := renderBar(prefix, proportion, barWidth, suffix, cols)
-	if cols > 0 {
-		// The line is sized to fit the terminal, so it never wraps onto extra
-		// rows; \033[K clears any leftovers from a previous, longer line.
-		fmt.Fprintf(writer, "\r%s\033[K", line)
+// drawStatus redraws the single-line status in place, trimmed to the terminal
+// so it can never wrap onto a second row.
+func drawStatus(writer io.Writer, line string) {
+	if cols := terminalWidth(writer); cols > 0 {
+		// \033[K clears any leftovers from a previous, longer line.
+		fmt.Fprintf(writer, "\r%s\033[K", truncateRunes(line, cols-1))
 		return
 	}
 	fmt.Fprintf(writer, "\r%s", line)
 }
 
-// renderBar builds the status line, sized to fit cols columns (cols <= 0 means
-// unlimited). It shrinks the bar first, then falls back to an ellipsis-truncated
-// text line, so a narrow terminal never wraps the status onto multiple rows.
-func renderBar(prefix string, proportion float64, barWidth int, suffix string, cols int) string {
+// statusLine assembles the progress line, e.g.
+//
+//	[DL]  50% of ~256 MB at 1.6 MB/s  ETA 2:05  seg 4/8
+//
+// The figures become known progressively — size, speed and ETA only exist once
+// the sampler has ticked — so each clause is included only when it has a value
+// and the line reads correctly at every stage.
+func statusLine(prefix string, proportion float64, estimate int64, speed float64, etaSeconds float64, done int, total int) string {
 	if proportion < 0 {
 		proportion = 0
 	}
 	if proportion > 1 {
 		proportion = 1
 	}
-	head := fmt.Sprintf("[%s] ", prefix)
-	tail := fmt.Sprintf("%6.2f%%", proportion*100)
-	if suffix != "" {
-		tail += " " + suffix
+	// "50% of ~256 MB at 1.6 MB/s" reads as one phrase: the connectives say
+	// which quantity the percentage and the rate belong to.
+	phrase := formatPercent(proportion)
+	if estimate > 0 {
+		phrase += " of ~" + humanizeBytesRough(estimate)
 	}
-	if cols > 0 {
-		budget := cols - 1
-		if budget < 1 {
-			budget = 1
-		}
-		// A bar narrower than this conveys almost nothing, so below it we drop
-		// the bar entirely rather than show a 1-2 cell stub.
-		const minBar = 4
-		// fixed chars around the bar contents: "[" plus "] "
-		fixed := utf8.RuneCountInString(head) + 3 + utf8.RuneCountInString(tail)
-		avail := budget - fixed
-		if avail < minBar {
-			return compactLine(prefix, proportion, suffix, budget)
-		}
-		if avail < barWidth {
-			barWidth = avail
-		}
+	if speed > 0 {
+		phrase += " at " + humanizeSpeed(speed)
 	}
-	if barWidth < 0 {
-		barWidth = 0
+	groups := []string{phrase}
+	if eta := formatETA(etaSeconds); eta != "" {
+		groups = append(groups, "ETA "+eta)
 	}
-	pos := int(proportion * float64(barWidth))
-	if pos > barWidth {
-		pos = barWidth
+	if total > 0 {
+		groups = append(groups, fmt.Sprintf("seg %d/%d", done, total))
 	}
-	bar := strings.Repeat("■", pos) + strings.Repeat(" ", barWidth-pos)
-	return head + "[" + bar + "] " + tail
-}
-
-// compactLine renders a bar-less status for terminals too narrow to fit a
-// useful bar. It keeps the most informative fields, first dropping the phase
-// label, and only ellipsis-truncates when even that will not fit.
-func compactLine(prefix string, proportion float64, suffix string, budget int) string {
-	parts := fmt.Sprintf("%.2f%%", proportion*100)
-	if suffix != "" {
-		parts += " " + suffix
-	}
-	if withPrefix := prefix + " " + parts; utf8.RuneCountInString(withPrefix) <= budget {
-		return withPrefix
-	}
-	if utf8.RuneCountInString(parts) <= budget {
-		return parts
-	}
-	return truncateRunes(parts, budget)
+	return "[" + prefix + "] " + strings.Join(groups, "  ")
 }
 
 // truncateRunes shortens s to at most max display columns, marking a cut with an

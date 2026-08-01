@@ -77,8 +77,8 @@ func TestHumanReporterShowsLiveSpeed(t *testing.T) {
 	ev.Speed = 2 * 1024 * 1024 // 2 MB/s
 	reporter.Event(ev)
 
-	if !strings.Contains(buf.String(), "2.00 MB/s") {
-		t.Fatalf("output = %q, want live speed 2.00 MB/s", buf.String())
+	if !strings.Contains(buf.String(), "2.0 MB/s") {
+		t.Fatalf("output = %q, want live speed 2.0 MB/s", buf.String())
 	}
 }
 
@@ -94,7 +94,7 @@ func TestHumanReporterKeepsLastSpeedBetweenTicks(t *testing.T) {
 	// A worker-driven redraw with no speed should still display the last speed.
 	reporter.Event(progressEvent(EventDownloadProgress, 6, 10))
 
-	if !strings.Contains(buf.String(), "2.00 MB/s") {
+	if !strings.Contains(buf.String(), "2.0 MB/s") {
 		t.Fatalf("output = %q, want last speed retained", buf.String())
 	}
 }
@@ -111,9 +111,28 @@ func TestHumanReporterShowsEstimateAndETA(t *testing.T) {
 	reporter.Event(ev)
 
 	output := buf.String()
-	for _, want := range []string{"~256.00 MB", "ETA 2:05"} {
+	for _, want := range []string{"~256 MB", "ETA 2:05"} {
 		if !strings.Contains(output, want) {
 			t.Fatalf("output = %q, want %q", output, want)
+		}
+	}
+}
+
+func TestFormatPercentFloorsAndKeepsWidth(t *testing.T) {
+	tests := []struct {
+		proportion float64
+		want       string
+	}{
+		{0, "  0%"},
+		{0.5, " 50%"},
+		{1, "100%"},
+		// Floors: must not read 100% until the work is actually complete.
+		{0.999, " 99%"},
+		{0.09, "  9%"},
+	}
+	for _, tt := range tests {
+		if got := formatPercent(tt.proportion); got != tt.want {
+			t.Fatalf("formatPercent(%v) = %q, want %q", tt.proportion, got, tt.want)
 		}
 	}
 }
@@ -152,7 +171,7 @@ func TestHumanReporterPrintsSummary(t *testing.T) {
 	})
 
 	output := buf.String()
-	for _, want := range []string{"[summary]", "1m23", "18.00 MB", "512.00 KB/s"} {
+	for _, want := range []string{"[summary]", "1m23", "18.00 MB", "512.0 KB/s"} {
 		if !strings.Contains(output, want) {
 			t.Fatalf("output = %q, want %q", output, want)
 		}
@@ -197,8 +216,34 @@ func TestHumanizeSpeed(t *testing.T) {
 	if got := humanizeSpeed(0); got != "0 B/s" {
 		t.Fatalf("humanizeSpeed(0) = %q, want 0 B/s", got)
 	}
-	if got := humanizeSpeed(2 * 1024 * 1024); got != "2.00 MB/s" {
-		t.Fatalf("humanizeSpeed(2MiB) = %q, want 2.00 MB/s", got)
+	if got := humanizeSpeed(2 * 1024 * 1024); got != "2.0 MB/s" {
+		t.Fatalf("humanizeSpeed(2MiB) = %q, want 2.0 MB/s", got)
+	}
+}
+
+func TestHumanizeBytesRough(t *testing.T) {
+	const gb = 1024 * 1024 * 1024
+	tests := []struct {
+		name string
+		n    int64
+		want string
+	}{
+		// Below GB a decimal adds nothing to an estimate.
+		{name: "MB drops decimals", n: 256*1024*1024 + 400*1024, want: "256 MB"},
+		{name: "small MB drops decimals", n: 9*1024*1024 + 300*1024, want: "9 MB"},
+		{name: "KB drops decimals", n: 5*1024 + 100, want: "5 KB"},
+		{name: "KB rounds to nearest", n: 5*1024 + 512, want: "6 KB"},
+		// At GB and above a decimal carries real information: 1.9 GB is nearly
+		// a gigabyte more than 1 GB, so it must not collapse to "2 GB".
+		{name: "GB keeps a decimal", n: 1*gb + 921*1024*1024, want: "1.9 GB"},
+		{name: "large GB keeps a decimal", n: 15*gb + 716*1024*1024, want: "15.7 GB"},
+		{name: "TB keeps a decimal", n: 2 * 1024 * gb, want: "2.0 TB"},
+		{name: "bytes unchanged", n: 512, want: "512 B"},
+	}
+	for _, tt := range tests {
+		if got := humanizeBytesRough(tt.n); got != tt.want {
+			t.Fatalf("%s: humanizeBytesRough(%d) = %q, want %q", tt.name, tt.n, got, tt.want)
+		}
 	}
 }
 
@@ -219,63 +264,76 @@ func TestHumanizeDuration(t *testing.T) {
 	}
 }
 
-func TestRenderBarUnlimitedKeepsFullBar(t *testing.T) {
-	line := renderBar("Downloading", 0.5, 40, "4/8  1.61 MB/s", 0)
-	if strings.Count(line, "■") != 20 {
-		t.Fatalf("line = %q, want 20 filled cells for a 40-wide half bar", line)
-	}
-	if !strings.Contains(line, "1.61 MB/s") {
-		t.Fatalf("line = %q, want full suffix", line)
+func TestStatusLineFullFormat(t *testing.T) {
+	got := statusLine("DL", 0.5, 256*1024*1024, 1.6*1024*1024, 125, 4, 8)
+	want := "[DL]  50% of ~256 MB at 1.6 MB/s  ETA 2:05  seg 4/8"
+	if got != want {
+		t.Fatalf("statusLine =\n  %q\nwant\n  %q", got, want)
 	}
 }
 
-func TestRenderBarFitsWithinWidth(t *testing.T) {
-	// Across a range of widths the rendered line must never exceed cols-1
-	// columns, so it can never wrap onto a second terminal row.
-	for cols := 10; cols <= 120; cols++ {
-		line := renderBar("Downloading", 1.0, 40, "8/8  1.61 MB/s", cols)
-		if n := utf8.RuneCountInString(line); n > cols-1 {
-			t.Fatalf("cols=%d: line width %d exceeds budget %d (%q)", cols, n, cols-1, line)
+func TestStatusLineOmitsUnknownFields(t *testing.T) {
+	// The figures arrive progressively: before the first sampler tick there is
+	// no size, speed or ETA, and the line must still read correctly.
+	tests := []struct {
+		name     string
+		estimate int64
+		speed    float64
+		eta      float64
+		want     string
+	}{
+		{
+			name: "nothing known yet",
+			want: "[DL]   0%  seg 0/8",
+		},
+		{
+			name:  "speed only, no estimate yet",
+			speed: 1.6 * 1024 * 1024,
+			want:  "[DL]   0% at 1.6 MB/s  seg 0/8",
+		},
+		{
+			name:     "size known but stalled, so no ETA",
+			estimate: 256 * 1024 * 1024,
+			want:     "[DL]   0% of ~256 MB  seg 0/8",
+		},
+	}
+	for _, tt := range tests {
+		got := statusLine("DL", 0, tt.estimate, tt.speed, tt.eta, 0, 8)
+		if got != tt.want {
+			t.Fatalf("%s: statusLine = %q, want %q", tt.name, got, tt.want)
 		}
 	}
 }
 
-func TestRenderBarShrinksBarBeforeText(t *testing.T) {
-	// A medium width keeps the bar and full text, just with a narrower bar.
-	line := renderBar("Downloading", 1.0, 40, "8/8  1.61 MB/s", 70)
-	if !strings.Contains(line, "[") || !strings.Contains(line, "]") {
-		t.Fatalf("line = %q, want a bracketed bar to remain", line)
-	}
-	if !strings.Contains(line, "1.61 MB/s") {
-		t.Fatalf("line = %q, want full suffix retained", line)
-	}
-	if strings.Count(line, "■") >= 40 {
-		t.Fatalf("line = %q, want the bar shrunk below 40 cells", line)
+func TestStatusLineMergePhase(t *testing.T) {
+	// Merging has no speed, size or ETA — only progress.
+	got := statusLine("Merge", 0.5, 0, 0, 0, 4, 8)
+	want := "[Merge]  50%  seg 4/8"
+	if got != want {
+		t.Fatalf("statusLine = %q, want %q", got, want)
 	}
 }
 
-func TestRenderBarCompactDropsBarKeepsInfo(t *testing.T) {
-	// Too narrow for a useful bar, but wide enough to keep the fields: the bar
-	// is dropped, the useful info (percent + segments) is kept.
-	line := renderBar("Downloading", 0.5, 40, "4/8", 30)
-	if strings.ContainsAny(line, "■[]") {
-		t.Fatalf("line = %q, want no bar decoration in compact mode", line)
+func TestStatusLineClampsProportion(t *testing.T) {
+	if got := statusLine("DL", 1.5, 0, 0, 0, 0, 0); !strings.Contains(got, "100%") {
+		t.Fatalf("statusLine = %q, want clamp to 100%%", got)
 	}
-	if !strings.Contains(line, "50.00%") || !strings.Contains(line, "4/8") {
-		t.Fatalf("line = %q, want percent and segment count retained", line)
-	}
-	if n := utf8.RuneCountInString(line); n > 29 {
-		t.Fatalf("compact line width %d exceeds budget 29 (%q)", n, line)
+	if got := statusLine("DL", -1, 0, 0, 0, 0, 0); !strings.Contains(got, "0%") {
+		t.Fatalf("statusLine = %q, want clamp to 0%%", got)
 	}
 }
 
-func TestRenderBarTruncatesWhenExtremelyNarrow(t *testing.T) {
-	line := renderBar("Downloading", 1.0, 40, "8/8  1.61 MB/s", 12)
-	if utf8.RuneCountInString(line) > 11 {
-		t.Fatalf("line = %q exceeds narrow budget", line)
+func TestTruncateRunesFitsBudget(t *testing.T) {
+	line := statusLine("DL", 0.5, 256*1024*1024, 1.6*1024*1024, 125, 4, 8)
+	// Whatever the terminal width, the drawn line must fit so it cannot wrap.
+	for budget := 1; budget <= utf8.RuneCountInString(line)+5; budget++ {
+		got := truncateRunes(line, budget)
+		if n := utf8.RuneCountInString(got); n > budget {
+			t.Fatalf("budget=%d: width %d exceeds it (%q)", budget, n, got)
+		}
 	}
-	if !strings.Contains(line, "…") {
-		t.Fatalf("line = %q, want an ellipsis marking truncation", line)
+	if !strings.Contains(truncateRunes(line, 20), "…") {
+		t.Fatal("a truncated line should be marked with an ellipsis")
 	}
 }
 

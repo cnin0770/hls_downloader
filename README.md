@@ -110,22 +110,31 @@ In JSON mode, successful TS cleanup emits a `ts_deleted` event.
 
 ### Progress, live speed, and summary
 
-During the download, the progress bar shows a live download speed, an estimated final
-size, and an ETA (all sampled once per second) alongside the segment count:
+During the download, a single status line is redrawn in place with a live download
+speed, an estimated final size, and an ETA (all sampled once per second) alongside the
+segment count:
 
 ```text
-[Downloading] [■■■■■■■■■■■■■■■          ]  50.00% 4/8  1.61 MB/s  ~256.40 MB  ETA 2:05
+[DL]  50% of ~256 MB at 1.6 MB/s  ETA 2:05  seg 4/8
+```
+
+The figures become known progressively, so the line starts as `[DL]  10%  seg 1/10` and
+fills out once the first sample has been taken. Merging uses the same line without the
+transfer figures:
+
+```text
+[Merge]  50%  seg 4/8
 ```
 
 The size estimate extrapolates from the segments finished so far, weighted by playlist
 duration rather than segment count so it tracks variable-bitrate streams. It is marked
 `~` because it is a projection: if the stream's bitrate ramps up later, early estimates
-read low and converge as the download proceeds.
+read low and converge as the download proceeds. It is shown without decimals below a
+gigabyte, and with one from a gigabyte up, where `~1.9 GB` says something meaningfully
+different from `~2 GB`.
 
-The progress bar adapts to the terminal width so it never wraps onto multiple rows: on
-a narrow window the bar shrinks, on a very narrow one the bar is dropped and only the
-key fields are shown (e.g. `50.00% 4/8`), and in the extreme case the line is truncated
-with an ellipsis.
+The line fits the terminal width, so it never wraps onto multiple rows; in a very narrow
+window it is truncated with an ellipsis.
 
 When a task completes, a summary line reports the total time, output file size, and
 average download speed:

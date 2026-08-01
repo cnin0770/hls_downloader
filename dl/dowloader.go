@@ -21,7 +21,6 @@ const (
 	tsExt             = ".ts"
 	defaultTimeLayout = "20060102150405"
 	tsTempFileSuffix  = "_tmp"
-	progressWidth     = 40
 )
 
 type Downloader struct {
