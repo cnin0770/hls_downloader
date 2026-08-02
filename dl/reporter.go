@@ -13,6 +13,7 @@ import (
 )
 
 const (
+	EventPlaylistReady     = "playlist_ready"
 	EventTaskStarted       = "task_started"
 	EventDownloadProgress  = "download_progress"
 	EventSegmentFailed     = "segment_failed"
@@ -53,6 +54,20 @@ type Event struct {
 	Speed            float64 `json:"speed,omitempty"`
 	EstimatedBytes   int64   `json:"estimated_bytes,omitempty"`
 	ETASeconds       float64 `json:"eta_seconds,omitempty"`
+	MissingSegments     []int   `json:"missing_segments,omitempty"`
+	MissingDuration     float64 `json:"missing_duration_seconds,omitempty"`
+	UnexplainedDuration float64 `json:"unexplained_seconds,omitempty"`
+	Gaps                []Gap   `json:"gaps,omitempty"`
+	Incomplete          bool    `json:"incomplete,omitempty"`
+	Bitrate             int64   `json:"bitrate,omitempty"`
+}
+
+// Gap is a discontinuity in the finished file. AtSeconds is measured on the
+// output's own timeline — the amount of playable content before the gap — so it
+// is where a viewer actually lands, not where the content sat in the source.
+type Gap struct {
+	AtSeconds      float64 `json:"at_seconds"`
+	MissingSeconds float64 `json:"missing_seconds"`
 }
 
 type Reporter interface {
@@ -77,6 +92,15 @@ func NewHumanReporter(writer io.Writer) *HumanReporter {
 
 func (r *HumanReporter) Event(ev Event) {
 	switch ev.Type {
+	case EventPlaylistReady:
+		line := fmt.Sprintf("[playlist] %s, %s", pluralSegments(ev.Total), formatClock(ev.ExpectedDuration))
+		if ev.EstimatedBytes > 0 {
+			line += fmt.Sprintf(", ~%s estimated", humanizeBytesRough(ev.EstimatedBytes))
+		}
+		if ev.Bitrate > 0 {
+			line += fmt.Sprintf(" (%s)", humanizeBitrate(ev.Bitrate))
+		}
+		fmt.Fprintln(r.writer, line)
 	case EventDownloadProgress:
 		// Sampler ticks carry live figures; worker redraws in between do not, so
 		// the last known values are kept to avoid the line flickering.
@@ -129,6 +153,54 @@ func (r *HumanReporter) printSummary(ev Event) {
 		humanizeDuration(ev.ElapsedSeconds),
 		humanizeBytes(ev.FileSize),
 		humanizeSpeed(ev.AverageSpeed))
+	if ev.Incomplete {
+		r.printGaps(ev)
+	}
+}
+
+// printGaps is the single report for everything that came out wrong, whether it
+// was found by tracking failed segments or by the duration probe. It reports in
+// terms a viewer can act on — how much is gone, and where in the finished file
+// the jumps land. Segment indexes stay in the JSON events for tools.
+func (r *HumanReporter) printGaps(ev Event) {
+	// A longer-than-expected output is a mismatch, not a loss: report it as
+	// such rather than claiming content is missing.
+	if ev.MissingDuration <= 0 {
+		if ev.UnexplainedDuration < 0 {
+			fmt.Fprintf(r.writer, "[suspect] duration mismatch: expected %s, got %s\n",
+				formatClock(ev.ExpectedDuration), formatClock(ev.ActualDuration))
+		}
+		return
+	}
+
+	line := fmt.Sprintf("[incomplete] lost %s", humanizeDuration(ev.MissingDuration))
+	if ev.ExpectedDuration > 0 {
+		line += " of " + formatClock(ev.ExpectedDuration)
+		if share := formatShare(ev.MissingDuration, ev.ExpectedDuration); share != "" {
+			line += " (" + share + ")"
+		}
+	}
+	// With no failed segments there are no positions to give, so say so on the
+	// same line rather than printing an empty gaps list.
+	if len(ev.Gaps) == 0 {
+		line += ", location unknown"
+	}
+	fmt.Fprintln(r.writer, line)
+
+	if len(ev.Gaps) > 0 {
+		marks := make([]string, 0, len(ev.Gaps)+1)
+		for _, gap := range ev.Gaps {
+			marks = append(marks, fmt.Sprintf("%s (-%s)",
+				formatClock(gap.AtSeconds), humanizeDuration(gap.MissingSeconds)))
+		}
+		if ev.UnexplainedDuration > 0 {
+			marks = append(marks, "+"+humanizeDuration(ev.UnexplainedDuration)+" elsewhere")
+		}
+		fmt.Fprintf(r.writer, "[gaps] %s\n", strings.Join(marks, ", "))
+	}
+	if ev.TSDir != "" {
+		fmt.Fprintf(r.writer, "[segments] kept for re-fetch: %s\n", ev.TSDir)
+	}
 }
 
 func (r *HumanReporter) Close() {}
@@ -210,6 +282,36 @@ func formatPercent(proportion float64) string {
 	return fmt.Sprintf("%3.0f%%", math.Floor(proportion*100))
 }
 
+// formatClock renders a position within a video as m:ss (or h:mm:ss). Unlike
+// formatETA it has no "unknown" case and no upper bound: 0:00 is a real
+// position rather than a missing value.
+func formatClock(seconds float64) string {
+	if seconds < 0 {
+		seconds = 0
+	}
+	total := int(seconds + 0.5)
+	hours := total / 3600
+	minutes := (total % 3600) / 60
+	secs := total % 60
+	if hours > 0 {
+		return fmt.Sprintf("%d:%02d:%02d", hours, minutes, secs)
+	}
+	return fmt.Sprintf("%d:%02d", minutes, secs)
+}
+
+// formatShare renders a proportion of the whole, avoiding a misleading "0.0%"
+// for a loss that is small but not nothing.
+func formatShare(part float64, whole float64) string {
+	if whole <= 0 || part <= 0 {
+		return ""
+	}
+	percent := part / whole * 100
+	if percent < 0.1 {
+		return "<0.1%"
+	}
+	return fmt.Sprintf("%.1f%%", percent)
+}
+
 // formatETA renders remaining time as m:ss (or h:mm:ss), the compact form
 // download tools conventionally use. It returns "" when there is nothing
 // meaningful to show, and refuses to quote absurd values from a stalled start.
@@ -228,6 +330,19 @@ func formatETA(seconds float64) string {
 		return fmt.Sprintf("%d:%02d:%02d", hours, minutes, secs)
 	}
 	return fmt.Sprintf("%d:%02d", minutes, secs)
+}
+
+// humanizeBitrate formats a declared stream bitrate, which playlists quote in
+// bits per second rather than bytes.
+func humanizeBitrate(bitsPerSecond int64) string {
+	switch {
+	case bitsPerSecond >= 1_000_000:
+		return fmt.Sprintf("%.1f Mbps", float64(bitsPerSecond)/1_000_000)
+	case bitsPerSecond >= 1_000:
+		return fmt.Sprintf("%.0f kbps", float64(bitsPerSecond)/1_000)
+	default:
+		return fmt.Sprintf("%d bps", bitsPerSecond)
+	}
 }
 
 // humanizeSpeed formats a throughput. One decimal is plenty for a figure that

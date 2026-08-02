@@ -19,10 +19,12 @@ var (
 	name         string
 	configPath   string
 	chanSize     int
+	retries      int
 	referer      string
 	userAgent    string
 	convertToMP4 bool
 	keepTS       bool
+	keepSegments bool
 	jsonOutput   bool
 	ffmpegLog    bool
 	printConfig  bool
@@ -32,12 +34,14 @@ func init() {
 	defaults := config.Default()
 	flag.StringVar(&url, "u", "", "M3U8 URL, required")
 	flag.IntVar(&chanSize, "c", defaults.Concurrency, "Maximum number of occurrences")
+	flag.IntVar(&retries, "retries", defaults.Retries, "Attempts per segment before giving up on it")
 	flag.StringVar(&output, "o", "", "Output folder (required unless set in config)")
 	flag.StringVar(&name, "n", "", "Output filename without extension (optional)")
 	flag.StringVar(&referer, "r", "", "Referer header to send with every request (optional)")
 	flag.StringVar(&userAgent, "ua", "", "User-Agent header to send with every request (optional)")
 	flag.BoolVar(&convertToMP4, "mp4", defaults.ConvertToMP4, "Convert merged TS to MP4 after download (optional)")
 	flag.BoolVar(&keepTS, "keep-ts", defaults.KeepTS, "Keep merged TS file after conversion")
+	flag.BoolVar(&keepSegments, "keep-segments", defaults.KeepSegments, "Keep downloaded segments when the download is incomplete, so missing ones can be re-fetched")
 	flag.BoolVar(&jsonOutput, "json", defaults.JSONOutput, "Emit newline-delimited JSON events")
 	flag.BoolVar(&ffmpegLog, "ffmpeg-log", defaults.FFmpegLog, "Show ffmpeg output during MP4 conversion")
 	flag.BoolVar(&printConfig, "print-config", false, "Print effective config as JSON and exit")
@@ -83,6 +87,9 @@ func run(cfg config.Config) error {
 	if cfg.Concurrency <= 0 {
 		return errors.New("parameter 'c' must be greater than 0")
 	}
+	if cfg.Retries <= 0 {
+		return errors.New("parameter 'retries' must be greater than 0")
+	}
 	tool.Referer = cfg.Referer
 	tool.UserAgent = cfg.UserAgent
 	downloader, err := dl.NewTask(cfg.DownloadDir, url, name)
@@ -95,6 +102,8 @@ func run(cfg config.Config) error {
 	if cfg.FFmpegLog {
 		downloader.SetRemuxer(dl.FFmpegRemuxer{Verbose: true})
 	}
+	downloader.SetRetries(cfg.Retries)
+	downloader.SetKeepSegments(cfg.KeepSegments)
 	downloader.SetConversion(cfg.ConvertToMP4, cfg.KeepTS)
 	if err := downloader.Start(cfg.Concurrency); err != nil {
 		return err
@@ -134,6 +143,9 @@ func applyFlagOverrides(cfg config.Config, set map[string]bool) config.Config {
 	if set["c"] {
 		cfg.Concurrency = chanSize
 	}
+	if set["retries"] {
+		cfg.Retries = retries
+	}
 	if set["r"] {
 		cfg.Referer = referer
 	}
@@ -145,6 +157,9 @@ func applyFlagOverrides(cfg config.Config, set map[string]bool) config.Config {
 	}
 	if set["keep-ts"] {
 		cfg.KeepTS = keepTS
+	}
+	if set["keep-segments"] {
+		cfg.KeepSegments = keepSegments
 	}
 	if set["json"] {
 		cfg.JSONOutput = jsonOutput

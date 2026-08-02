@@ -13,6 +13,12 @@ type Result struct {
 	URL  *url.URL
 	M3u8 *M3u8
 	Keys map[int]string
+	// Master is the master playlist the URL pointed at, when it did. The
+	// variant it selects becomes M3u8, but the master is retained: it is the
+	// only place that declares alternate audio renditions and stream bitrates.
+	Master *M3u8
+	// Variant is the entry of Master that was selected.
+	Variant *MasterPlaylist
 }
 
 func FromURL(link string) (*Result, error) {
@@ -33,7 +39,14 @@ func FromURL(link string) (*Result, error) {
 	}
 	if len(m3u8.MasterPlaylist) != 0 {
 		sf := m3u8.MasterPlaylist[0]
-		return FromURL(tool.ResolveURL(u, sf.URI))
+		result, err := FromURL(tool.ResolveURL(u, sf.URI))
+		if err != nil {
+			return nil, err
+		}
+		// Keep the master: the variant alone does not say whether audio is a
+		// separate rendition, nor what bitrate to expect.
+		result.Master, result.Variant = m3u8, sf
+		return result, nil
 	}
 	if len(m3u8.Segments) == 0 {
 		return nil, errors.New("can not found any TS file description")

@@ -32,10 +32,31 @@ type M3u8 struct {
 	MediaSequence  uint64 // Default 0, #EXT-X-MEDIA-SEQUENCE:sequence
 	Segments       []*Segment
 	MasterPlaylist []*MasterPlaylist
+	Media          []*Rendition // #EXT-X-MEDIA (alternate audio, subtitles, ...)
+	Map            *MediaInit   // #EXT-X-MAP: present on fMP4/CMAF playlists
 	Keys           map[int]*Key
 	EndList        bool         // #EXT-X-ENDLIST
 	PlaylistType   PlaylistType // VOD or EVENT
 	TargetDuration float64      // #EXT-X-TARGETDURATION:duration
+}
+
+// MediaInit is the initialization segment of an fMP4/CMAF playlist.
+// #EXT-X-MAP:URI="init.mp4"
+type MediaInit struct {
+	URI    string
+	Length uint64 // #EXT-X-MAP:BYTERANGE length[@offset]
+	Offset uint64
+}
+
+// Rendition is an alternate track carried outside the main variant, such as a
+// separate audio stream.
+// #EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aud",NAME="English",DEFAULT=YES,URI="a.m3u8"
+type Rendition struct {
+	Type    string // AUDIO, VIDEO, SUBTITLES, CLOSED-CAPTIONS
+	GroupID string
+	Name    string
+	URI     string
+	Default bool
 }
 
 type Segment struct {
@@ -49,11 +70,13 @@ type Segment struct {
 
 // #EXT-X-STREAM-INF:PROGRAM-ID=1,BANDWIDTH=240000,RESOLUTION=416x234,CODECS="avc1.42e00a,mp4a.40.2"
 type MasterPlaylist struct {
-	URI        string
-	BandWidth  uint32
-	Resolution string
-	Codecs     string
-	ProgramID  uint32
+	URI          string
+	BandWidth    uint32
+	AvgBandWidth uint32 // AVERAGE-BANDWIDTH, a better basis for a size estimate
+	Resolution   string
+	Codecs       string
+	ProgramID    uint32
+	AudioGroup   string // AUDIO="<group-id>": audio lives in a separate rendition
 }
 
 // #EXT-X-KEY:METHOD=AES-128,URI="key.key"
@@ -117,6 +140,18 @@ func parse(reader io.Reader) (*M3u8, error) {
 			if _, err := fmt.Sscanf(line, "#EXT-X-VERSION:%d", &m3u8.Version); err != nil {
 				return nil, err
 			}
+		case strings.HasPrefix(line, "#EXT-X-MAP:"):
+			mediaInit, err := parseMediaInit(line)
+			if err != nil {
+				return nil, fmt.Errorf("%s, line: %d", err.Error(), i+1)
+			}
+			m3u8.Map = mediaInit
+		case strings.HasPrefix(line, "#EXT-X-MEDIA:"):
+			rendition, err := parseRendition(line)
+			if err != nil {
+				return nil, fmt.Errorf("%s, line: %d", err.Error(), i+1)
+			}
+			m3u8.Media = append(m3u8.Media, rendition)
 		// Parse master playlist
 		case strings.HasPrefix(line, "#EXT-X-STREAM-INF:"):
 			mp, err := parseMasterPlaylist(line)
@@ -211,7 +246,7 @@ func parse(reader io.Reader) (*M3u8, error) {
 			key.URI = params["URI"]
 			key.IV = params["IV"]
 			m3u8.Keys[keyIndex] = key
-		case line == "#EndList":
+		case strings.HasPrefix(line, "#EXT-X-ENDLIST"):
 			m3u8.EndList = true
 		default:
 			continue
@@ -219,6 +254,58 @@ func parse(reader io.Reader) (*M3u8, error) {
 	}
 
 	return m3u8, nil
+}
+
+// parseMediaInit reads #EXT-X-MAP, the initialization segment that fMP4/CMAF
+// playlists require before their fragments mean anything.
+func parseMediaInit(line string) (*MediaInit, error) {
+	params := parseLineParameters(line)
+	uri := params["URI"]
+	if uri == "" {
+		return nil, errors.New("invalid EXT-X-MAP: missing URI")
+	}
+	mediaInit := &MediaInit{URI: uri}
+	if byteRange := params["BYTERANGE"]; byteRange != "" {
+		length, offset, err := parseByteRange(byteRange)
+		if err != nil {
+			return nil, fmt.Errorf("invalid EXT-X-MAP BYTERANGE: %s", err.Error())
+		}
+		mediaInit.Length, mediaInit.Offset = length, offset
+	}
+	return mediaInit, nil
+}
+
+// parseRendition reads #EXT-X-MEDIA, which points at a track stored outside the
+// variant stream — most often the audio for a video-only variant.
+func parseRendition(line string) (*Rendition, error) {
+	params := parseLineParameters(line)
+	if len(params) == 0 {
+		return nil, errors.New("invalid EXT-X-MEDIA: empty parameters")
+	}
+	return &Rendition{
+		Type:    params["TYPE"],
+		GroupID: params["GROUP-ID"],
+		Name:    params["NAME"],
+		URI:     params["URI"],
+		Default: strings.EqualFold(params["DEFAULT"], "YES"),
+	}, nil
+}
+
+// parseByteRange reads a "length[@offset]" value.
+func parseByteRange(value string) (length uint64, offset uint64, err error) {
+	if strings.Contains(value, "@") {
+		split := strings.Split(value, "@")
+		offset, err = strconv.ParseUint(split[1], 10, 64)
+		if err != nil {
+			return 0, 0, err
+		}
+		value = split[0]
+	}
+	length, err = strconv.ParseUint(value, 10, 64)
+	if err != nil {
+		return 0, 0, err
+	}
+	return length, offset, nil
 }
 
 func parseMasterPlaylist(line string) (*MasterPlaylist, error) {
@@ -235,6 +322,14 @@ func parseMasterPlaylist(line string) (*MasterPlaylist, error) {
 				return nil, err
 			}
 			mp.BandWidth = uint32(v)
+		case k == "AVERAGE-BANDWIDTH":
+			v, err := strconv.ParseUint(v, 10, 32)
+			if err != nil {
+				return nil, err
+			}
+			mp.AvgBandWidth = uint32(v)
+		case k == "AUDIO":
+			mp.AudioGroup = v
 		case k == "RESOLUTION":
 			mp.Resolution = v
 		case k == "PROGRAM-ID":

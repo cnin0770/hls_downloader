@@ -149,18 +149,18 @@ func TestConvertKeepsTSByDefault(t *testing.T) {
 		reporter: reporter,
 	}
 
-	mp4File, err := downloader.convert(tsFile)
+	conv, err := downloader.convert(tsFile, false, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if mp4File != filepath.Join(dir, "movie.mp4") {
-		t.Fatalf("mp4File = %q, want movie.mp4", mp4File)
+	if conv.mp4File != filepath.Join(dir, "movie.mp4") {
+		t.Fatalf("mp4File = %q, want movie.mp4", conv.mp4File)
 	}
 	if _, err := os.Stat(tsFile); err != nil {
 		t.Fatalf("TS file should be kept: %s", err)
 	}
-	if remuxer.input != tsFile || remuxer.output != mp4File {
-		t.Fatalf("remux input/output = %q/%q, want %q/%q", remuxer.input, remuxer.output, tsFile, mp4File)
+	if remuxer.input != tsFile || remuxer.output != conv.mp4File {
+		t.Fatalf("remux input/output = %q/%q, want %q/%q", remuxer.input, remuxer.output, tsFile, conv.mp4File)
 	}
 	if !hasEvent(reporter.events, EventConversionStarted) || !hasEvent(reporter.events, EventConversionDone) {
 		t.Fatalf("events = %+v, want conversion started and done", reporter.events)
@@ -181,7 +181,7 @@ func TestConvertDeletesTSWhenKeepTSFalse(t *testing.T) {
 		reporter: reporter,
 	}
 
-	if _, err := downloader.convert(tsFile); err != nil {
+	if _, err := downloader.convert(tsFile, false, 0); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(tsFile); !os.IsNotExist(err) {
@@ -206,7 +206,7 @@ func TestConvertReportsFailureAndKeepsTS(t *testing.T) {
 		reporter: reporter,
 	}
 
-	_, err := downloader.convert(tsFile)
+	_, err := downloader.convert(tsFile, false, 0)
 	if err == nil {
 		t.Fatal("expected error")
 	}
@@ -240,12 +240,12 @@ func TestConvertMarksSuspectAndKeepsTS(t *testing.T) {
 		},
 	}
 
-	mp4File, err := downloader.convert(tsFile)
+	conv, err := downloader.convert(tsFile, false, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if mp4File != filepath.Join(dir, "movie.000140.mp4") {
-		t.Fatalf("mp4File = %q, want movie.000140.mp4", mp4File)
+	if conv.mp4File != filepath.Join(dir, "movie.000140.mp4") {
+		t.Fatalf("mp4File = %q, want movie.000140.mp4", conv.mp4File)
 	}
 	if _, err := os.Stat(tsFile); err != nil {
 		t.Fatalf("TS file should be kept after suspect conversion: %s", err)

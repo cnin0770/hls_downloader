@@ -2,11 +2,13 @@ package dl
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"io"
 	"io/ioutil"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -21,11 +23,15 @@ const (
 	tsExt             = ".ts"
 	defaultTimeLayout = "20060102150405"
 	tsTempFileSuffix  = "_tmp"
+
+	// DefaultRetries is how many times a segment is attempted before it is
+	// given up on. Attempts are spaced by retryBackoff, capped at maxBackoff.
+	DefaultRetries = 3
+	retryBackoff   = time.Second
+	maxBackoff     = 8 * time.Second
 )
 
 type Downloader struct {
-	lock     sync.Mutex
-	queue    []int
 	folder   string
 	tsFolder string
 	filename string
@@ -35,19 +41,33 @@ type Downloader struct {
 	doneMS   int64 // playlist duration of completed segments, in milliseconds
 	doneB    int64 // bytes written by completed segments
 
+	failedMu   sync.Mutex
+	failedSegs []int // segments given up on after exhausting their retries
+
 	result   *parse.Result
+	warnings []string   // raised by preflight, emitted once the reporter exists
 	progress chan Event // all goroutines send here; reporter owns stdout
 	reporter Reporter
 	remuxer  Remuxer
 	prober   DurationProber
 
+	retries      int
 	convertToMP4 bool
 	keepTS       bool
+	keepSegments bool
+	keptSegments bool // set when the segment folder was actually retained
 }
 
 // NewTask returns a Task instance
 func NewTask(output string, url string, name string) (*Downloader, error) {
 	result, err := parse.FromURL(url)
+	if err != nil {
+		return nil, err
+	}
+	// Reject what cannot work before creating any folders or fetching anything:
+	// the alternative is a full download that was never going to produce a
+	// usable file.
+	warnings, err := preflight(result, url)
 	if err != nil {
 		return nil, err
 	}
@@ -80,10 +100,28 @@ func NewTask(output string, url string, name string) (*Downloader, error) {
 		remuxer:  FFmpegRemuxer{},
 		prober:   FFprobeDurationProber{},
 		keepTS:   true,
+		retries:  DefaultRetries,
+		warnings: warnings,
 	}
 	d.segLen = len(result.M3u8.Segments)
-	d.queue = genSlice(d.segLen)
 	return d, nil
+}
+
+// SetRetries sets how many times each segment is attempted before being given
+// up on. Values below 1 fall back to a single attempt.
+func (d *Downloader) SetRetries(retries int) {
+	if retries < 1 {
+		retries = 1
+	}
+	d.retries = retries
+}
+
+// SetKeepSegments keeps the downloaded segment files when the download ends up
+// incomplete, so the missing ones can be re-fetched and merged in. A complete
+// download always cleans up: keeping a full copy of every segment alongside the
+// finished file would just double the space used.
+func (d *Downloader) SetKeepSegments(keep bool) {
+	d.keepSegments = keep
 }
 
 func (d *Downloader) SetReporter(reporter Reporter) {
@@ -112,8 +150,14 @@ func (d *Downloader) SetDurationProber(prober DurationProber) {
 	d.prober = prober
 }
 
-// Start runs the downloader with a concurrent progress bar.
+// Start downloads, merges and optionally converts the playlist.
 func (d *Downloader) Start(concurrency int) error {
+	return d.StartContext(context.Background(), concurrency)
+}
+
+// StartContext is Start with cancellation: when ctx is cancelled the workers
+// stop taking new segments and the run unwinds instead of finishing.
+func (d *Downloader) StartContext(ctx context.Context, concurrency int) error {
 	var wg sync.WaitGroup
 	taskStart := time.Now()
 
@@ -125,6 +169,12 @@ func (d *Downloader) Start(concurrency int) error {
 			d.reporter.Event(ev)
 		}
 	}()
+	// What is about to be downloaded, before it starts: a wrong URL or an
+	// unwanted variant is obvious immediately rather than an hour later.
+	d.reporter.Event(playlistSummary(d.result, d.segLen, d.expectedDuration()))
+	for _, warning := range d.warnings {
+		d.reporter.Event(Event{Type: EventWarning, Message: warning})
+	}
 	d.reporter.Event(Event{
 		Type:             EventTaskStarted,
 		OutputDir:        d.folder,
@@ -180,28 +230,32 @@ func (d *Downloader) Start(concurrency int) error {
 	}()
 
 	// --- download workers ---
-	limitChan := make(chan struct{}, concurrency)
-	for {
-		tsIdx, end, err := d.next()
-		if err != nil {
-			if end {
-				break
-			}
-			continue
-		}
-		wg.Add(1)
-		go func(idx int) {
-			defer wg.Done()
-			if err := d.download(idx); err != nil {
-				d.progress <- segmentFailedEvent(idx, fmt.Sprintf("[failed] seg %d: %s", idx, err.Error()))
-				if err := d.back(idx); err != nil {
-					d.progress <- Event{Type: EventWarning, Message: err.Error()}
-				}
-			}
-			<-limitChan
-		}(tsIdx)
-		limitChan <- struct{}{}
+	// A fixed pool draining a job channel: it always terminates once the jobs
+	// are exhausted, whether or not every segment succeeded. Sending on an
+	// unbuffered channel provides the backpressure that a semaphore used to,
+	// with no spinning while workers are busy.
+	if concurrency < 1 {
+		concurrency = 1
 	}
+	jobs := make(chan int)
+	for i := 0; i < concurrency; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for idx := range jobs {
+				d.fetchSegment(ctx, idx)
+			}
+		}()
+	}
+dispatch:
+	for i := 0; i < d.segLen; i++ {
+		select {
+		case jobs <- i:
+		case <-ctx.Done():
+			break dispatch
+		}
+	}
+	close(jobs)
 	wg.Wait()
 	downloadElapsed := time.Since(taskStart)
 
@@ -215,17 +269,49 @@ func (d *Downloader) Start(concurrency int) error {
 	<-reporterDone
 	d.reporter.Event(Event{Type: EventDownloadDone})
 
-	tsFile, err := d.merge()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	// Segments given up on are exact knowledge that the result is short, so the
+	// output is marked incomplete without relying on the duration heuristic.
+	// Failures are not announced here: they are folded into the single
+	// completion report below, so one defect is not reported three times.
+	failed := d.failedSegments()
+	gaps, knownMissing := gapsFromFailures(d.playlistSegments(), failed)
+
+	tsFile, err := d.merge(failed)
 	if err != nil {
 		return err
 	}
-	taskDone := Event{Type: EventTaskDone, TSFile: tsFile}
+	taskDone := Event{
+		Type:             EventTaskDone,
+		TSFile:           tsFile,
+		MissingSegments:  failed,
+		Gaps:             gaps,
+		MissingDuration:  knownMissing,
+		ExpectedDuration: d.expectedDuration(),
+		Incomplete:       len(failed) > 0,
+	}
+	if d.keptSegments {
+		taskDone.TSDir = d.tsFolder
+	}
 	if d.convertToMP4 {
-		mp4File, err := d.convert(tsFile)
+		conv, err := d.convert(tsFile, len(failed) > 0, knownMissing)
 		if err != nil {
 			return err
 		}
-		taskDone.MP4File = mp4File
+		taskDone.MP4File = conv.mp4File
+		taskDone.ActualDuration = conv.actual
+		if conv.hasUnexplained {
+			taskDone.UnexplainedDuration = conv.unexplained
+			taskDone.Incomplete = true
+			// Only a shortfall adds to what was lost; a longer-than-expected
+			// output is a mismatch, not missing content.
+			if conv.unexplained > 0 {
+				taskDone.MissingDuration += conv.unexplained
+			}
+		}
 	}
 	d.fillSummary(&taskDone, taskStart, downloadElapsed)
 	d.reporter.Event(taskDone)
@@ -316,47 +402,174 @@ func (d *Downloader) download(segIndex int) error {
 	return nil
 }
 
-func (d *Downloader) next() (segIndex int, end bool, err error) {
-	d.lock.Lock()
-	defer d.lock.Unlock()
-	if len(d.queue) == 0 {
-		err = fmt.Errorf("queue empty")
-		// d.finish is updated atomically by worker goroutines that do not hold
-		// d.lock, so it must be read atomically here too.
-		if atomic.LoadInt32(&d.finish) == int32(d.segLen) {
-			end = true
+// fetchSegment downloads one segment, retrying up to d.retries times with a
+// growing pause between attempts. When the attempts are exhausted the segment
+// is recorded as failed and the run continues: giving up on a segment is what
+// lets the download terminate at all, so the caller must treat the recorded
+// failures as an incomplete result rather than a success.
+func (d *Downloader) fetchSegment(ctx context.Context, segIndex int) {
+	for attempt := 1; ; attempt++ {
+		if ctx.Err() != nil {
 			return
 		}
-		end = false
-		return
-	}
-	segIndex = d.queue[0]
-	d.queue = d.queue[1:]
-	return
-}
-
-func (d *Downloader) back(segIndex int) error {
-	d.lock.Lock()
-	defer d.lock.Unlock()
-	if sf := d.result.M3u8.Segments[segIndex]; sf == nil {
-		return fmt.Errorf("invalid segment index: %d", segIndex)
-	}
-	d.queue = append(d.queue, segIndex)
-	return nil
-}
-
-func (d *Downloader) merge() (string, error) {
-	d.reporter.Event(Event{Type: EventMergeStarted, Total: d.segLen})
-	missingCount := 0
-	for idx := 0; idx < d.segLen; idx++ {
-		tsFilename := tsFilename(idx)
-		f := filepath.Join(d.tsFolder, tsFilename)
-		if _, err := os.Stat(f); err != nil {
-			missingCount++
+		err := d.download(segIndex)
+		if err == nil {
+			return
+		}
+		if attempt >= d.retries {
+			d.recordFailure(segIndex, err)
+			return
+		}
+		d.report(segmentFailedEvent(segIndex,
+			fmt.Sprintf("[retry %d/%d] seg %d: %s", attempt, d.retries-1, segIndex, err.Error())))
+		select {
+		case <-time.After(retryDelay(attempt)):
+		case <-ctx.Done():
+			return
 		}
 	}
-	if missingCount > 0 {
-		d.reporter.Event(Event{Type: EventWarning, Message: fmt.Sprintf("%d files missing", missingCount)})
+}
+
+// retryDelay backs off between attempts so a struggling server is not hammered.
+func retryDelay(attempt int) time.Duration {
+	delay := retryBackoff << (attempt - 1)
+	if delay > maxBackoff || delay <= 0 {
+		return maxBackoff
+	}
+	return delay
+}
+
+func (d *Downloader) recordFailure(segIndex int, err error) {
+	d.failedMu.Lock()
+	d.failedSegs = append(d.failedSegs, segIndex)
+	d.failedMu.Unlock()
+	d.report(segmentFailedEvent(segIndex,
+		fmt.Sprintf("[failed] seg %d after %s: %s", segIndex, plural(d.retries, "attempt"), err.Error())))
+}
+
+// failedSegments returns the sorted indexes of segments that were given up on.
+func (d *Downloader) failedSegments() []int {
+	d.failedMu.Lock()
+	defer d.failedMu.Unlock()
+	out := append([]int(nil), d.failedSegs...)
+	sort.Ints(out)
+	return out
+}
+
+// report queues an event without ever blocking a worker.
+func (d *Downloader) report(ev Event) {
+	select {
+	case d.progress <- ev:
+	default:
+	}
+}
+
+// gapsFromFailures maps failed segment indexes onto the finished file's own
+// timeline. A gap is a point, not a span: the missing content is simply absent,
+// so everything after it shifts earlier and consecutive failures collapse into
+// one discontinuity. It also returns the total duration lost.
+func gapsFromFailures(segments []*parse.Segment, failed []int) ([]Gap, float64) {
+	if len(failed) == 0 || len(segments) == 0 {
+		return nil, 0
+	}
+	missing := make(map[int]bool, len(failed))
+	for _, seg := range failed {
+		missing[seg] = true
+	}
+	var gaps []Gap
+	var kept, lost float64
+	inGap := false
+	for idx, segment := range segments {
+		var duration float64
+		if segment != nil {
+			duration = float64(segment.Duration)
+		}
+		if missing[idx] {
+			lost += duration
+			if inGap {
+				// Still the same discontinuity: widen it rather than adding one.
+				gaps[len(gaps)-1].MissingSeconds += duration
+			} else {
+				gaps = append(gaps, Gap{AtSeconds: kept, MissingSeconds: duration})
+				inGap = true
+			}
+			continue
+		}
+		// Only surviving segments advance the output timeline.
+		kept += duration
+		inGap = false
+	}
+	return gaps, lost
+}
+
+// plural renders a count with its unit, adding an "s" only when needed, so
+// messages never read "1 attempts".
+func plural(n int, unit string) string {
+	if n == 1 {
+		return "1 " + unit
+	}
+	return fmt.Sprintf("%d %ss", n, unit)
+}
+
+func pluralSegments(n int) string {
+	return plural(n, "segment")
+}
+
+// summarizeSegments renders segment indexes compactly, collapsing runs into
+// ranges so a long outage reads as "seg 41-89" rather than fifty numbers.
+func summarizeSegments(segments []int) string {
+	if len(segments) == 0 {
+		return ""
+	}
+	const maxGroups = 5
+	var groups []string
+	start, prev := segments[0], segments[0]
+	flush := func() {
+		if start == prev {
+			groups = append(groups, strconv.Itoa(start))
+			return
+		}
+		groups = append(groups, fmt.Sprintf("%d-%d", start, prev))
+	}
+	for _, seg := range segments[1:] {
+		if seg == prev+1 {
+			prev = seg
+			continue
+		}
+		flush()
+		start, prev = seg, seg
+	}
+	flush()
+	if len(groups) > maxGroups {
+		return strings.Join(groups[:maxGroups], ", ") +
+			fmt.Sprintf(", and %d more", len(groups)-maxGroups)
+	}
+	return strings.Join(groups, ", ")
+}
+
+// merge concatenates the downloaded segments. known lists segments already
+// reported as failed, so merge only warns about files it finds missing for some
+// other reason — the failures themselves have already been announced.
+func (d *Downloader) merge(known []int) (string, error) {
+	d.reporter.Event(Event{Type: EventMergeStarted, Total: d.segLen})
+	expected := make(map[int]bool, len(known))
+	for _, seg := range known {
+		expected[seg] = true
+	}
+	var unexpected []int
+	for idx := 0; idx < d.segLen; idx++ {
+		f := filepath.Join(d.tsFolder, tsFilename(idx))
+		if _, err := os.Stat(f); err != nil && !expected[idx] {
+			unexpected = append(unexpected, idx)
+		}
+	}
+	if len(unexpected) > 0 {
+		d.reporter.Event(Event{
+			Type:            EventWarning,
+			MissingSegments: unexpected,
+			Message: fmt.Sprintf("%s missing from disk before merge: %s",
+				pluralSegments(len(unexpected)), summarizeSegments(unexpected)),
+		})
 	}
 	mFilePath := filepath.Join(d.folder, d.filename)
 	mFile, err := os.Create(mFilePath)
@@ -381,36 +594,65 @@ func (d *Downloader) merge() (string, error) {
 		d.reporter.Event(progressEvent(EventMergeProgress, mergedCount, d.segLen))
 	}
 	_ = writer.Flush()
-	_ = os.RemoveAll(d.tsFolder)
+	if d.keepSegments && len(known) > 0 {
+		// Retained only because segments are missing: the surviving files let
+		// the gaps be re-fetched by index and merged in.
+		d.keptSegments = true
+	} else {
+		_ = os.RemoveAll(d.tsFolder)
+	}
 
-	if mergedCount != d.segLen {
-		d.reporter.Event(Event{Type: EventWarning, Message: fmt.Sprintf("%d files merge failed", d.segLen-mergedCount)})
+	// Only surprises are worth a warning here: segments already given up on
+	// during download were reported at the time.
+	if short := d.segLen - mergedCount - len(known); short > 0 {
+		d.reporter.Event(Event{
+			Type:    EventWarning,
+			Message: fmt.Sprintf("%s could not be merged", pluralSegments(short)),
+		})
 	}
 	d.reporter.Event(Event{Type: EventMergeDone, TSFile: mFilePath})
 	return mFilePath, nil
 }
 
-func (d *Downloader) convert(tsFile string) (string, error) {
+// conversion carries what the remux and duration probe learned, so the caller
+// can fold it into a single completion report.
+type conversion struct {
+	mp4File        string
+	actual         float64
+	unexplained    float64
+	hasUnexplained bool
+}
+
+// convert remuxes the merged TS to MP4. knownMissing is the duration already
+// known to be absent because segments failed to download; anything short beyond
+// that is unexplained and points at the remux or the source data rather than at
+// the download.
+func (d *Downloader) convert(tsFile string, incomplete bool, knownMissing float64) (conversion, error) {
 	mp4File := mp4Filename(tsFile)
 	d.reporter.Event(Event{Type: EventConversionStarted, TSFile: tsFile, MP4File: mp4File})
 	if err := d.remuxer.RemuxTS(tsFile, mp4File); err != nil {
 		d.reporter.Event(Event{Type: EventConversionFailed, TSFile: tsFile, MP4File: mp4File, Message: err.Error()})
-		return "", err
+		return conversion{}, err
 	}
 	expected := d.expectedDuration()
 	actual, err := d.prober.Duration(mp4File)
 	if err != nil {
 		d.reporter.Event(Event{Type: EventConversionFailed, TSFile: tsFile, MP4File: mp4File, Message: err.Error()})
-		return "", err
+		return conversion{}, err
 	}
-	suspect := durationSuspect(expected, actual)
+	unexplained, hasUnexplained := unexplainedShortfall(expected, actual, knownMissing)
+	suspect := incomplete || hasUnexplained
 	if suspect {
 		suspectFile := suspectMP4Filename(mp4File, expected)
 		if err := os.Rename(mp4File, suspectFile); err != nil {
 			d.reporter.Event(Event{Type: EventConversionFailed, TSFile: tsFile, MP4File: mp4File, Message: err.Error()})
-			return "", err
+			return conversion{}, err
 		}
 		mp4File = suspectFile
+		reason := fmt.Sprintf("expected %.3fs, got %.3fs", expected, actual)
+		if incomplete {
+			reason = "segments are missing; " + reason
+		}
 		d.reporter.Event(Event{
 			Type:             EventConversionSuspect,
 			TSFile:           tsFile,
@@ -418,7 +660,7 @@ func (d *Downloader) convert(tsFile string) (string, error) {
 			ExpectedDuration: expected,
 			ActualDuration:   actual,
 			Suspect:          true,
-			Message:          fmt.Sprintf("expected %.3fs, got %.3fs", expected, actual),
+			Message:          reason,
 		})
 	}
 	d.reporter.Event(Event{
@@ -429,13 +671,18 @@ func (d *Downloader) convert(tsFile string) (string, error) {
 		ActualDuration:   actual,
 		Suspect:          suspect,
 	})
-	if suspect {
-		return mp4File, nil
+	result := conversion{mp4File: mp4File, actual: actual, unexplained: unexplained, hasUnexplained: hasUnexplained}
+	// The merged TS is only worth retaining when the remux itself is in doubt:
+	// then it is the pristine copy and the MP4 is the questionable artifact. If
+	// segments are simply missing, the TS has the identical gaps and offers no
+	// recovery path, so the user's -keep-ts choice stands.
+	if hasUnexplained {
+		return result, nil
 	}
 	if !d.keepTS {
 		d.cleanupTS(tsFile)
 	}
-	return mp4File, nil
+	return result, nil
 }
 
 func (d *Downloader) cleanupTS(tsFile string) {
@@ -449,6 +696,15 @@ func (d *Downloader) cleanupTS(tsFile string) {
 func (d *Downloader) tsURL(segIndex int) string {
 	seg := d.result.M3u8.Segments[segIndex]
 	return tool.ResolveURL(d.result.URL, seg.URI)
+}
+
+// playlistSegments returns the parsed segments, or nil when the playlist is
+// unavailable (as in unit tests that build a Downloader directly).
+func (d *Downloader) playlistSegments() []*parse.Segment {
+	if d.result == nil || d.result.M3u8 == nil {
+		return nil
+	}
+	return d.result.M3u8.Segments
 }
 
 func (d *Downloader) expectedDuration() float64 {
@@ -540,14 +796,6 @@ func outputFilename(name string, defaultName string) string {
 		return name
 	}
 	return name + tsExt
-}
-
-func genSlice(len int) []int {
-	s := make([]int, 0)
-	for i := 0; i < len; i++ {
-		s = append(s, i)
-	}
-	return s
 }
 
 func progressEvent(eventType string, done int, total int) Event {

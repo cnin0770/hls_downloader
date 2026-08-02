@@ -11,10 +11,12 @@ const appSupportFolder = "HLS Downloader"
 type Config struct {
 	DownloadDir  string `json:"downloadDir"`
 	Concurrency  int    `json:"concurrency"`
+	Retries      int    `json:"retries"`
 	Referer      string `json:"referer"`
 	UserAgent    string `json:"userAgent"`
 	ConvertToMP4 bool   `json:"convertToMp4"`
 	KeepTS       bool   `json:"keepTs"`
+	KeepSegments bool   `json:"keepSegments"`
 	JSONOutput   bool   `json:"jsonOutput"`
 	FFmpegLog    bool   `json:"ffmpegLog"`
 }
@@ -22,6 +24,7 @@ type Config struct {
 func Default() Config {
 	return Config{
 		Concurrency: 25,
+		Retries:     3,
 		KeepTS:      true,
 	}
 }

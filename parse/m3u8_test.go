@@ -100,3 +100,95 @@ func TestParseLineParameters(t *testing.T) {
 		t.Fatalf("params = %+v", got)
 	}
 }
+
+func TestParseMediaInitAndRenditions(t *testing.T) {
+	playlist := `#EXTM3U
+#EXT-X-VERSION:7
+#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aud",NAME="English",DEFAULT=YES,URI="audio.m3u8"
+#EXT-X-STREAM-INF:BANDWIDTH=4000000,AVERAGE-BANDWIDTH=2000000,AUDIO="aud"
+video.m3u8
+`
+	m3u8, err := parse(strings.NewReader(playlist))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(m3u8.Media) != 1 {
+		t.Fatalf("Media = %+v, want one rendition", m3u8.Media)
+	}
+	audio := m3u8.Media[0]
+	if audio.Type != "AUDIO" || audio.GroupID != "aud" || audio.Name != "English" || !audio.Default {
+		t.Fatalf("rendition = %+v, want the parsed audio track", audio)
+	}
+	if audio.URI != "audio.m3u8" {
+		t.Fatalf("rendition URI = %q, want audio.m3u8", audio.URI)
+	}
+	if len(m3u8.MasterPlaylist) != 1 {
+		t.Fatalf("MasterPlaylist = %+v, want one variant", m3u8.MasterPlaylist)
+	}
+	variant := m3u8.MasterPlaylist[0]
+	if variant.AvgBandWidth != 2000000 || variant.BandWidth != 4000000 {
+		t.Fatalf("variant bandwidths = %d/%d, want 4000000/2000000", variant.BandWidth, variant.AvgBandWidth)
+	}
+	if variant.AudioGroup != "aud" {
+		t.Fatalf("variant AudioGroup = %q, want aud", variant.AudioGroup)
+	}
+}
+
+func TestParseExtXMap(t *testing.T) {
+	playlist := `#EXTM3U
+#EXT-X-VERSION:6
+#EXT-X-MAP:URI="/path/init.mp4"
+#EXTINF:3.000,
+seg0.m4s
+#EXT-X-ENDLIST
+`
+	m3u8, err := parse(strings.NewReader(playlist))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m3u8.Map == nil {
+		t.Fatal("Map = nil, want the init segment")
+	}
+	if m3u8.Map.URI != "/path/init.mp4" {
+		t.Fatalf("Map.URI = %q, want /path/init.mp4", m3u8.Map.URI)
+	}
+}
+
+func TestParseExtXMapWithByteRange(t *testing.T) {
+	playlist := `#EXTM3U
+#EXT-X-MAP:URI="init.mp4",BYTERANGE="718@0"
+#EXTINF:3.000,
+seg0.m4s
+#EXT-X-ENDLIST
+`
+	m3u8, err := parse(strings.NewReader(playlist))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m3u8.Map == nil || m3u8.Map.Length != 718 || m3u8.Map.Offset != 0 {
+		t.Fatalf("Map = %+v, want length 718 at offset 0", m3u8.Map)
+	}
+}
+
+// #EXT-X-ENDLIST is what marks a playlist complete; the tag was previously
+// matched against a string that never appears in a real playlist, so EndList
+// was always false.
+func TestParseEndListMarksVODComplete(t *testing.T) {
+	vod := "#EXTM3U\n#EXT-X-VERSION:3\n#EXTINF:6.0,\nseg0.ts\n#EXT-X-ENDLIST\n"
+	m3u8, err := parse(strings.NewReader(vod))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !m3u8.EndList {
+		t.Fatal("EndList = false, want true for a playlist ending in #EXT-X-ENDLIST")
+	}
+
+	live := "#EXTM3U\n#EXT-X-VERSION:3\n#EXTINF:6.0,\nseg0.ts\n"
+	m3u8, err = parse(strings.NewReader(live))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m3u8.EndList {
+		t.Fatal("EndList = true, want false when the tag is absent")
+	}
+}

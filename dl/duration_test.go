@@ -2,6 +2,7 @@ package dl
 
 import (
 	"errors"
+	"math"
 	"reflect"
 	"strings"
 	"testing"
@@ -107,6 +108,54 @@ func TestDurationSuspect(t *testing.T) {
 		if got != tt.want {
 			t.Fatalf("%s: durationSuspect(%v, %v) = %v, want %v",
 				tt.name, tt.expected, tt.actual, got, tt.want)
+		}
+	}
+}
+
+func TestUnexplainedShortfall(t *testing.T) {
+	tests := []struct {
+		name         string
+		expected     float64
+		actual       float64
+		knownMissing float64
+		want         float64
+		significant  bool
+	}{
+		{
+			// Failed segments account for the whole shortfall: nothing else is wrong.
+			name: "fully explained by missing segments",
+			expected: 7264, actual: 7228, knownMissing: 36,
+			want: 0, significant: false,
+		},
+		{
+			// Short by more than the failed segments explain.
+			name: "extra loss beyond the failed segments",
+			expected: 7264, actual: 7114, knownMissing: 36,
+			want: 114, significant: true,
+		},
+		{
+			// No segment failed, so the whole shortfall is unexplained. 20s is
+			// inside the 1% tolerance of a 2-hour video, so it is not flagged.
+			name: "small shortfall stays within tolerance",
+			expected: 7264, actual: 7244, knownMissing: 0,
+			want: 20, significant: false,
+		},
+		{
+			name: "output longer than expected is negative",
+			expected: 120, actual: 200, knownMissing: 0,
+			want: -80, significant: true,
+		},
+		{
+			name: "unknown durations are never significant",
+			expected: 0, actual: 100, knownMissing: 0,
+			want: 0, significant: false,
+		},
+	}
+	for _, tt := range tests {
+		got, significant := unexplainedShortfall(tt.expected, tt.actual, tt.knownMissing)
+		if math.Abs(got-tt.want) > 0.001 || significant != tt.significant {
+			t.Fatalf("%s: unexplainedShortfall = (%v, %v), want (%v, %v)",
+				tt.name, got, significant, tt.want, tt.significant)
 		}
 	}
 }

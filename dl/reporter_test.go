@@ -137,6 +137,39 @@ func TestFormatPercentFloorsAndKeepsWidth(t *testing.T) {
 	}
 }
 
+func TestFormatClock(t *testing.T) {
+	tests := []struct {
+		seconds float64
+		want    string
+	}{
+		{0, "0:00"}, // unlike an ETA, zero is a real position
+		{-3, "0:00"},
+		{12, "0:12"},
+		{72, "1:12"},
+		{7264, "2:01:04"},
+	}
+	for _, tt := range tests {
+		if got := formatClock(tt.seconds); got != tt.want {
+			t.Fatalf("formatClock(%v) = %q, want %q", tt.seconds, got, tt.want)
+		}
+	}
+}
+
+func TestFormatShare(t *testing.T) {
+	if got := formatShare(36, 7264); got != "0.5%" {
+		t.Fatalf("formatShare(36, 7264) = %q, want 0.5%%", got)
+	}
+	// A tiny but real loss must not be rounded away to "0.0%".
+	if got := formatShare(1, 100000); got != "<0.1%" {
+		t.Fatalf("formatShare(1, 100000) = %q, want <0.1%%", got)
+	}
+	for _, tt := range [][2]float64{{0, 100}, {10, 0}} {
+		if got := formatShare(tt[0], tt[1]); got != "" {
+			t.Fatalf("formatShare(%v, %v) = %q, want empty", tt[0], tt[1], got)
+		}
+	}
+}
+
 func TestFormatETA(t *testing.T) {
 	tests := []struct {
 		seconds float64
@@ -179,6 +212,150 @@ func TestHumanReporterPrintsSummary(t *testing.T) {
 	// bytes downloaded stays in the JSON event only, not the human summary line.
 	if strings.Contains(output, "20.00 MB") {
 		t.Fatalf("human summary should not show total downloaded, got %q", output)
+	}
+}
+
+func TestHumanReporterSummaryReportsGapsInTime(t *testing.T) {
+	var buf bytes.Buffer
+	reporter := NewHumanReporter(&buf)
+
+	reporter.Event(Event{
+		Type:             EventTaskDone,
+		ElapsedSeconds:   10,
+		FileSize:         1024 * 1024,
+		AverageSpeed:     1024,
+		Incomplete:       true,
+		MissingSegments:  []int{2, 9, 10, 11, 12, 17},
+		MissingDuration:  36,
+		ExpectedDuration: 7264,
+		Gaps: []Gap{
+			{AtSeconds: 12, MissingSeconds: 6},
+			{AtSeconds: 48, MissingSeconds: 24},
+			{AtSeconds: 72, MissingSeconds: 6},
+		},
+	})
+
+	output := buf.String()
+	for _, want := range []string{
+		"[incomplete] lost 36s of 2:01:04 (0.5%)",
+		"[gaps] 0:12 (-6s), 0:48 (-24s), 1:12 (-6s)",
+	} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("output = %q, want %q", output, want)
+		}
+	}
+	// Segment indexes belong in the JSON events, not the human report.
+	if strings.Contains(output, "seg ") {
+		t.Fatalf("output = %q, should not name segment indexes", output)
+	}
+}
+
+func TestHumanReporterReportsUnexplainedShortfall(t *testing.T) {
+	var buf bytes.Buffer
+	reporter := NewHumanReporter(&buf)
+
+	// 36s from failed segments plus 14s lost somewhere the gaps do not explain.
+	reporter.Event(Event{
+		Type:                EventTaskDone,
+		ElapsedSeconds:      10,
+		FileSize:            1024,
+		Incomplete:          true,
+		MissingDuration:     50,
+		UnexplainedDuration: 14,
+		ExpectedDuration:    120,
+		Gaps: []Gap{
+			{AtSeconds: 12, MissingSeconds: 6},
+			{AtSeconds: 48, MissingSeconds: 24},
+			{AtSeconds: 72, MissingSeconds: 6},
+		},
+	})
+
+	output := buf.String()
+	if !strings.Contains(output, "[incomplete] lost 50s of 2:00 (41.7%)") {
+		t.Fatalf("output = %q, want the combined total", output)
+	}
+	if !strings.Contains(output, "+14s elsewhere") {
+		t.Fatalf("output = %q, want the unexplained remainder appended to the gaps", output)
+	}
+}
+
+func TestHumanReporterReportsShortfallWithoutPositions(t *testing.T) {
+	var buf bytes.Buffer
+	reporter := NewHumanReporter(&buf)
+
+	// The duration probe found a shortfall but no segment failed, so there are
+	// no positions to report.
+	reporter.Event(Event{
+		Type:                EventTaskDone,
+		ElapsedSeconds:      10,
+		FileSize:            1024,
+		Incomplete:          true,
+		MissingDuration:     20,
+		UnexplainedDuration: 20,
+		ExpectedDuration:    7264,
+	})
+
+	output := buf.String()
+	if !strings.Contains(output, "[incomplete] lost 20s of 2:01:04 (0.3%), location unknown") {
+		t.Fatalf("output = %q, want the shortfall with location unknown", output)
+	}
+	if strings.Contains(output, "[gaps]") {
+		t.Fatalf("output = %q, should not print an empty gaps line", output)
+	}
+}
+
+func TestHumanReporterReportsLongerThanExpected(t *testing.T) {
+	var buf bytes.Buffer
+	reporter := NewHumanReporter(&buf)
+
+	// Output longer than the playlist claims is a mismatch, not a loss.
+	reporter.Event(Event{
+		Type:                EventTaskDone,
+		ElapsedSeconds:      10,
+		FileSize:            1024,
+		Incomplete:          true,
+		UnexplainedDuration: -14,
+		ExpectedDuration:    120,
+		ActualDuration:      134,
+	})
+
+	output := buf.String()
+	if !strings.Contains(output, "[suspect] duration mismatch: expected 2:00, got 2:14") {
+		t.Fatalf("output = %q, want a mismatch line", output)
+	}
+	if strings.Contains(output, "lost") {
+		t.Fatalf("output = %q, must not claim content was lost", output)
+	}
+}
+
+func TestHumanReporterReportsKeptSegments(t *testing.T) {
+	var buf bytes.Buffer
+	reporter := NewHumanReporter(&buf)
+
+	reporter.Event(Event{
+		Type:             EventTaskDone,
+		ElapsedSeconds:   10,
+		FileSize:         1024,
+		Incomplete:       true,
+		MissingDuration:  6,
+		ExpectedDuration: 120,
+		Gaps:             []Gap{{AtSeconds: 12, MissingSeconds: 6}},
+		TSDir:            "/data/example/20260727205231",
+	})
+
+	if !strings.Contains(buf.String(), "[segments] kept for re-fetch: /data/example/20260727205231") {
+		t.Fatalf("output = %q, want the retained segment folder", buf.String())
+	}
+}
+
+func TestHumanReporterSummaryHidesSegmentsWhenComplete(t *testing.T) {
+	var buf bytes.Buffer
+	reporter := NewHumanReporter(&buf)
+
+	reporter.Event(Event{Type: EventTaskDone, ElapsedSeconds: 10, FileSize: 1024})
+
+	if strings.Contains(buf.String(), "incomplete") {
+		t.Fatalf("a complete download should not mention gaps, got %q", buf.String())
 	}
 }
 

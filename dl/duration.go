@@ -103,6 +103,20 @@ func durationSuspect(expected float64, actual float64) bool {
 	return math.Abs(expected-actual) > durationTolerance(expected)
 }
 
+// unexplainedShortfall reports how much of the duration gap is *not* accounted
+// for by segments already known to be missing. Failed segments explain their own
+// shortfall exactly, so what remains is content lost some other way — a
+// truncated response that still returned 200, or a bad remux. The result is
+// significant only beyond the usual tolerance, since EXTINF values are
+// approximate and the residual is never exactly zero.
+func unexplainedShortfall(expected float64, actual float64, knownMissing float64) (float64, bool) {
+	if expected <= 0 || actual <= 0 {
+		return 0, false
+	}
+	residual := (expected - actual) - knownMissing
+	return residual, math.Abs(residual) > durationTolerance(expected)
+}
+
 func suspectMP4Filename(mp4Path string, expected float64) string {
 	suffix := "." + durationTag(expected)
 	ext := filepath.Ext(mp4Path)
